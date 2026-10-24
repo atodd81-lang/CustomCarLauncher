@@ -1,23 +1,27 @@
 package com.custom.carlauncher
 
-import android.app.ActivityManager
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.graphics.*
-import android.graphics.drawable.ColorDrawable
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import java.text.SimpleDateFormat
@@ -30,6 +34,27 @@ class MainActivity : AppCompatActivity() {
     private lateinit var locationManager: LocationManager
     private lateinit var dashboardView: AgamaDashboardView
 
+    // Captures track metadata from standard Android & car music players without needing Notification Access
+    private val mediaMetadataReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent == null) return
+            val track = intent.getStringExtra("track")
+                ?: intent.getStringExtra("title")
+                ?: intent.getStringExtra("music_title")
+            val artist = intent.getStringExtra("artist")
+                ?: intent.getStringExtra("author")
+                ?: intent.getStringExtra("music_artist")
+            val playing = if (intent.hasExtra("playing")) {
+                intent.getBooleanExtra("playing", true)
+            } else if (intent.hasExtra("playstate")) {
+                intent.getBooleanExtra("playstate", true)
+            } else {
+                true
+            }
+            dashboardView.updateMediaInfo(artist, track, playing)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -39,7 +64,39 @@ class MainActivity : AppCompatActivity() {
         dashboardView = AgamaDashboardView(this, mediaHelper)
         setContentView(dashboardView)
 
+        registerMediaBroadcasts()
         startGpsUpdates()
+    }
+
+    private fun registerMediaBroadcasts() {
+        val filter = IntentFilter().apply {
+            addAction("com.android.music.metachanged")
+            addAction("com.android.music.playstatechanged")
+            addAction("com.android.music.playbackcomplete")
+            addAction("com.spotify.music.metadatachanged")
+            addAction("com.spotify.music.playbackstatechanged")
+            addAction("com.maxmpz.audioplayer.TRACK_CHANGED")
+            addAction("com.maxmpz.audioplayer.STATUS_CHANGED")
+            addAction("com.amazon.mp3.metachanged")
+            addAction("fm.last.android.metachanged")
+            addAction("com.nullsoft.winamp.metachanged")
+            addAction("com.miui.player.metachanged")
+            addAction("com.andrew.apollo.metachanged")
+            addAction("com.microntek.music.toast")
+            addAction("com.xyauto.music.metachanged")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(mediaMetadataReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(mediaMetadataReceiver, filter)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            unregisterReceiver(mediaMetadataReceiver)
+        } catch (_: Exception) {}
     }
 
     private fun startGpsUpdates() {
@@ -51,22 +108,15 @@ class MainActivity : AppCompatActivity() {
                 object : LocationListener {
                     override fun onLocationChanged(location: Location) {
                         val mph = if (location.hasSpeed()) (location.speed * 2.23694f).toInt() else 0
-                        val sats = location.extras?.getInt("satellites", 12) ?: 12
-                        val compass = if (location.hasBearing()) {
-                            val dirs = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-                            val idx = (((location.bearing + 22.5f) % 360f) / 45f).toInt() and 7
-                            dirs[idx]
-                        } else {
-                            null
-                        }
-                        dashboardView.updateGpsData(mph, sats, compass)
+                        val bearing = if (location.hasBearing()) location.bearing else null
+                        dashboardView.updateGpsData(mph, bearing)
                     }
                     @Deprecated("Deprecated in Java")
                     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
                 }
             )
         } catch (_: SecurityException) {
-            // Standard fallback if GPS permission not yet toggled in Android settings
+            // Standard fallback if GPS permission is not yet toggled
         }
     }
 
@@ -76,7 +126,7 @@ class MainActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_MEDIA_PAUSE,
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                 mediaHelper.playPause()
-                dashboardView.togglePlayText()
+                dashboardView.togglePlayState()
                 true
             }
             KeyEvent.KEYCODE_MEDIA_NEXT -> {
@@ -101,83 +151,86 @@ class AgamaDashboardView(
         context.getSharedPreferences("agama_subaru_prefs", Context.MODE_PRIVATE)
     private val audioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private val activityManager =
-        context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
-    // Skin Colors:
-    // - Outer word ring (podColor) is 5% lighter gray (#303540)
-    // - Inner icon ring (innerRingColor) is 20% lighter gray (#5C6270)
-    private var primaryColor = prefs.getInt("primary_color_v2", Color.parseColor("#E6192E"))
-    private var secondaryColor = prefs.getInt("secondary_color_v2", Color.parseColor("#4A90E2"))
+    // Colors: True Crimson Red (#E6192E), Blue (#4A90E2)
+    // #2: Inner icon ring 35% lighter gray (#5E6578)
+    // #4: Outer word wing 5% lighter gray (#2D323E)
+    private var primaryColor = prefs.getInt("primary_color_v3", Color.parseColor("#E6192E"))
+    private var secondaryColor = prefs.getInt("secondary_color_v3", Color.parseColor("#4A90E2"))
     private val bgDark = Color.parseColor("#111318")
-    private val podColor = Color.parseColor("#303540")
-    private val podPressedColor = Color.parseColor("#434A58")
-    private val innerRingColor = Color.parseColor("#5C6270")
+    private val podColor = Color.parseColor("#2D323E")
+    private val podPressedColor = Color.parseColor("#3E4556")
+    private val innerRingColor = Color.parseColor("#5E6578")
     private val hubBgColor = Color.parseColor("#16181F")
 
-    // Center Hub Mode: 0 = Subaru Logo, 1 = Speedometer, 2 = Digital Clock
+    // State Variables
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
-    private var satelliteCount = 12
-    private var currentCompass = "N"
+    private var compassDir = prefs.getString("last_compass", "N") ?: "N"
+    private var temperatureF = prefs.getInt("temp_f", 59)
     private var isPlayingState = false
+    private var currentSongInfo: String = ""
+    private var scrollXOffset = 0f
     private var pressedZone: String? = null
-
-    // Track apps opened so they can be swiped closed in the Recents screen
-    private val openedPackages = LinkedHashSet<String>()
 
     private val wingKeys = listOf("RADIO", "CARPLAY", "MUSIC", "PHONE", "INTERNET", "APPS")
 
-    private val iconNames = arrayOf(
-        "Radio Tuner",
-        "CarPlay / Screen",
+    // Standard Selectable Icons (#3)
+    private val iconTypeNames = arrayOf(
+        "Radio Receiver",
+        "CarPlay / Media Screen",
         "Music Note",
         "Phone Handset",
         "Internet Globe",
         "Apps 9-Dot Grid",
         "Navigation Arrow",
         "Bluetooth Symbol",
-        "Equalizer Sliders",
+        "Equalizer / DSP",
         "Camera / Dashcam",
-        "Engine / OBD Gauge",
-        "Video / YouTube"
+        "Car / Gauge",
+        "Folder / USB"
     )
 
-    // Core Paints
+    // Paints
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val groovePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 9f
         color = Color.parseColor("#111318")
+        strokeCap = Paint.Cap.BUTT
     }
-    private val dashedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+
+    // #8: Slightly thicker stitching-style dotted lines
+    private val stitchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 2.5f
-        color = Color.parseColor("#D5DAE2")
-        pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+        strokeWidth = 3.8f
+        color = Color.parseColor("#E4E8F0")
+        strokeCap = Paint.Cap.ROUND
+        pathEffect = DashPathEffect(floatArrayOf(11f, 9.5f), 0f)
     }
+
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         style = Paint.Style.FILL
     }
-    // Slightly thinner white border on text (reduced from 3.2f to 1.6f)
+
+    // #12: Slightly thinner white border on text and icons
     private val textWhiteOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         style = Paint.Style.STROKE
-        strokeWidth = 1.6f
+        strokeWidth = 1.7f
         color = Color.WHITE
         strokeJoin = Paint.Join.ROUND
         strokeCap = Paint.Cap.ROUND
     }
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 4.4f
+        strokeWidth = 4.2f
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
-    // Slightly thinner white border on icons (reduced from 7.8f to 6.0f)
     private val iconWhiteOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 6.0f
@@ -191,27 +244,52 @@ class AgamaDashboardView(
         color = Color.WHITE
     }
 
-    private val tickRunnable = object : Runnable {
+    // Animation ticker for scrolling song info and clock updates
+    private val tickerRunnable = object : Runnable {
         override fun run() {
-            invalidate()
-            postDelayed(this, 10000L)
+            val activeAudio = audioManager.isMusicActive || isPlayingState
+            if (activeAudio) {
+                scrollXOffset += 3.2f
+                invalidate()
+                postDelayed(this, 40L)
+            } else {
+                invalidate()
+                postDelayed(this, 5000L)
+            }
         }
     }
 
     init {
-        post(tickRunnable)
+        post(tickerRunnable)
     }
 
-    fun updateGpsData(mph: Int, sats: Int, compass: String?) {
+    fun updateGpsData(mph: Int, bearing: Float?) {
         currentMph = mph
-        satelliteCount = if (sats > 0) sats else 12
-        if (compass != null) {
-            currentCompass = compass
+        if (bearing != null) {
+            val dirs = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+            val norm = ((bearing % 360f) + 360f) % 360f
+            val idx = ((norm + 22.5f) / 45f).toInt() % 8
+            compassDir = dirs[idx]
+            prefs.edit().putString("last_compass", compassDir).apply()
         }
         invalidate()
     }
 
-    fun togglePlayText() {
+    fun updateMediaInfo(artist: String?, track: String?, playing: Boolean) {
+        isPlayingState = playing
+        val cleanTrack = track?.trim().orEmpty()
+        val cleanArtist = artist?.trim().orEmpty()
+        if (cleanTrack.isNotEmpty() || cleanArtist.isNotEmpty()) {
+            currentSongInfo = if (cleanArtist.isNotEmpty() && cleanTrack.isNotEmpty()) {
+                "$cleanArtist — $cleanTrack"
+            } else {
+                cleanTrack.ifEmpty { cleanArtist }
+            }
+        }
+        invalidate()
+    }
+
+    fun togglePlayState() {
         isPlayingState = !isPlayingState
         invalidate()
     }
@@ -224,6 +302,19 @@ class AgamaDashboardView(
         canvas.drawText(text, x, y, textPaint)
     }
 
+    // Exact horizontal distance from center (cx) to the inner dotted circle at height y
+    private fun getDxInner(y: Float, cy: Float, rInner: Float): Float {
+        val dy = abs(y - cy)
+        return if (dy < rInner) sqrt(rInner * rInner - dy * dy) else 0f
+    }
+
+    // Exact horizontal distance from center (cx) to the outer curved dotted boundary at height y
+    private fun getDxOuter(y: Float, cy: Float, rxOuter: Float, ryOuter: Float): Float {
+        val dy = y - cy
+        val ratio = (dy * dy) / (ryOuter * ryOuter)
+        return if (ratio < 1f) rxOuter * sqrt(1f - ratio) else 0f
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val w = width.toFloat()
@@ -233,15 +324,14 @@ class AgamaDashboardView(
 
         canvas.drawColor(bgDark)
 
-        val rHub = h * 0.28f
-        val rInner = h * 0.45f
-        val rxOuter = w * 0.41f
-        val ryOuter = h * 0.48f
+        val rHub = h * 0.29f
+        val rInner = h * 0.465f
+        val rxOuter = w * 0.47f
+        val ryOuter = h * 0.58f
 
         drawOuterWings(canvas, cx, cy, w, h, rInner, rxOuter, ryOuter)
-        drawInnerRing(canvas, cx, cy, rHub, rInner)
+        drawInnerRing(canvas, cx, cy, h, rHub, rInner)
         drawCentralHub(canvas, cx, cy, rHub)
-        drawCornerPodsOutsideDottedLine(canvas, w, h)
     }
 
     private fun drawOuterWings(
@@ -262,97 +352,113 @@ class AgamaDashboardView(
         val y2 = h * 0.39f
         val y3 = h * 0.61f
         val y4 = h * 0.81f
-        val rowCenters = floatArrayOf(h * 0.10f, h * 0.29f, h * 0.50f, h * 0.71f, h * 0.90f)
+        val rowCenters = floatArrayOf(h * 0.095f, h * 0.29f, h * 0.50f, h * 0.71f, h * 0.905f)
 
         // Highlight pressed outer wing button
         pressedZone?.let { zone ->
-            if (zone.startsWith("WING_")) {
-                val key = zone.removePrefix("WING_")
+            if (zone.startsWith("WING_") || zone in listOf("RECENTS_TOP_LEFT", "TEMP_TOP_RIGHT", "VOICE", "GEAR_SKIN", "GEAR_HOME")) {
                 fillPaint.color = podPressedColor
-                val idx = when (key) {
-                    "RADIO", "PHONE" -> 1
-                    "CARPLAY", "INTERNET" -> 2
-                    "MUSIC", "APPS" -> 3
-                    else -> -1
+                val rowIdx = when (zone) {
+                    "RECENTS_TOP_LEFT", "TEMP_TOP_RIGHT" -> 0
+                    "WING_RADIO", "WING_PHONE" -> 1
+                    "WING_CARPLAY", "WING_INTERNET" -> 2
+                    "WING_MUSIC", "WING_APPS" -> 3
+                    else -> 4
                 }
-                if (idx != -1) {
-                    val topY = when (idx) { 1 -> y1; 2 -> y2; else -> y3 }
-                    val botY = when (idx) { 1 -> y2; 2 -> y3; else -> y4 }
-                    val leftX = if (key in listOf("RADIO", "CARPLAY", "MUSIC")) 0f else cx
-                    val rightX = if (leftX == 0f) cx else w
-                    canvas.save()
-                    canvas.clipRect(leftX, topY, rightX, botY)
-                    canvas.drawOval(wingRect, fillPaint)
-                    canvas.restore()
-                }
+                val topY = when (rowIdx) { 0 -> 0f; 1 -> y1; 2 -> y2; 3 -> y3; else -> y4 }
+                val botY = when (rowIdx) { 0 -> y1; 1 -> y2; 2 -> y3; 3 -> y4; else -> h }
+                val isLeft = zone in listOf("RECENTS_TOP_LEFT", "WING_RADIO", "WING_CARPLAY", "WING_MUSIC", "VOICE")
+                canvas.save()
+                canvas.clipRect(if (isLeft) 0f else cx, topY, if (isLeft) cx else w, botY)
+                canvas.drawOval(wingRect, fillPaint)
+                canvas.restore()
             }
         }
 
-        // Req 1: Horizontal light-colored dashed lines start strictly at the outside of the inside
-        // dotted circle (dxInner) and end strictly at the outside dotted curved line (dxOuter)
-        strokePaint.strokeWidth = 9f
-        strokePaint.color = bgDark
+        // #1: Horizontal lines strictly start at outside of inside dotted curve and end at outside dotted curve
+        val rInnerStitch = rInner + 4f
         for (y in floatArrayOf(y1, y2, y3, y4)) {
-            val dy = abs(y - cy)
-            if (dy < rInner && dy < ryOuter) {
-                val dxInner = sqrt(rInner * rInner - dy * dy) + 3f
-                val ratio = dy / ryOuter
-                val dxOuter = rxOuter * sqrt(1f - ratio * ratio) - 3f
-                if (dxOuter > dxInner) {
-                    // Left wing horizontal divider
-                    canvas.drawLine(cx - dxOuter, y, cx - dxInner, y, strokePaint)
-                    canvas.drawLine(cx - dxOuter, y, cx - dxInner, y, dashedPaint)
-                    // Right wing horizontal divider
-                    canvas.drawLine(cx + dxInner, y, cx + dxOuter, y, strokePaint)
-                    canvas.drawLine(cx + dxInner, y, cx + dxOuter, y, dashedPaint)
-                }
+            val dxIn = getDxInner(y, cy, rInnerStitch)
+            val dxOut = getDxOuter(y, cy, rxOuter, ryOuter)
+            if (dxOut > dxIn) {
+                // Left horizontal stitch line
+                canvas.drawLine(cx - dxOut, y, cx - dxIn, y, groovePaint)
+                canvas.drawLine(cx - dxOut + 3f, y, cx - dxIn - 3f, y, stitchPaint)
+                // Right horizontal stitch line
+                canvas.drawLine(cx + dxIn, y, cx + dxOut, y, groovePaint)
+                canvas.drawLine(cx + dxIn + 3f, y, cx + dxOut - 3f, y, stitchPaint)
             }
         }
 
-        // Outer curved dashed boundary arcs on left and right
-        canvas.drawArc(wingRect, 126f, 108f, false, dashedPaint)
-        canvas.drawArc(wingRect, -54f, 108f, false, dashedPaint)
-
-        // Left & Right Wing Text Labels centered between inner and outer dotted lines
-        val labelSize = h * 0.036f
-        val left keysLeft = arrayOf("RADIO", "CARPLAY", "MUSIC")
-        val keysRight = arrayOf("PHONE", "INTERNET", "APPS")
-
-        for (i in 0..2) {
-            val rowY = rowCenters[i + 1]
-            val dy = abs(rowY - cy)
-            val dxInner = sqrt(rInner * rInner - dy * dy)
-            val dxOuter = rxOuter * sqrt(1f - (dy / ryOuter).pow(2))
-            val midOffset = (dxInner + dxOuter) / 2f
-
-            val leftKey = keysLeft[i]
-            val rightKey = keysRight[i]
-            val leftLabel = prefs.getString("label_$leftKey", leftKey) ?: leftKey
-            val rightLabel = prefs.getString("label_$rightKey", rightKey) ?: rightKey
-
-            drawRedOutlinedText(canvas, leftLabel, cx - midOffset, rowY + 10f, labelSize)
-            drawRedOutlinedText(canvas, rightLabel, cx + midOffset, rowY + 10f, labelSize)
+        // Outer Left & Right Curved Stitching Borders (exact match to getDxOuter)
+        val leftOuterPath = Path()
+        val rightOuterPath = Path()
+        val steps = 60
+        for (i in 0..steps) {
+            val py = (i.toFloat() / steps) * h
+            val dxOut = getDxOuter(py, cy, rxOuter, ryOuter)
+            if (i == 0) {
+                leftOuterPath.moveTo(cx - dxOut, py)
+                rightOuterPath.moveTo(cx + dxOut, py)
+            } else {
+                leftOuterPath.lineTo(cx - dxOut, py)
+                rightOuterPath.lineTo(cx + dxOut, py)
+            }
         }
+        canvas.drawPath(leftOuterPath, groovePaint)
+        canvas.drawPath(leftOuterPath, stitchPaint)
+        canvas.drawPath(rightOuterPath, groovePaint)
+        canvas.drawPath(rightOuterPath, stitchPaint)
+
+        // Wing Text Labels (Centered between inner and outer dotted lines at each row's height)
+        val labelSize = h * 0.038f
+        val leftSlots = arrayOf("RADIO" to rowCenters[1], "CARPLAY" to rowCenters[2], "MUSIC" to rowCenters[3])
+        for ((key, ry) in leftSlots) {
+            val midX = cx - (getDxInner(ry, cy, rInnerStitch) + getDxOuter(ry, cy, rxOuter, ryOuter)) / 2f
+            val label = prefs.getString("label_$key", key) ?: key
+            drawRedOutlinedText(canvas, label, midX, ry + labelSize * 0.35f, labelSize)
+        }
+
+        val rightSlots = arrayOf("PHONE" to rowCenters[1], "INTERNET" to rowCenters[2], "APPS" to rowCenters[3])
+        for ((key, ry) in rightSlots) {
+            val midX = cx + (getDxInner(ry, cy, rInnerStitch) + getDxOuter(ry, cy, rxOuter, ryOuter)) / 2f
+            val label = prefs.getString("label_$key", key) ?: key
+            drawRedOutlinedText(canvas, label, midX, ry + labelSize * 0.35f, labelSize)
+        }
+
+        // #7: Four Corner Blue Icons placed strictly between the inner and outer dotted lines
+        val topCornerMidOffset = (getDxInner(rowCenters[0], cy, rInnerStitch) + getDxOuter(rowCenters[0], cy, rxOuter, ryOuter)) / 2f
+        val botCornerMidOffset = (getDxInner(rowCenters[4], cy, rInnerStitch) + getDxOuter(rowCenters[4], cy, rxOuter, ryOuter)) / 2f
+
+        // #9: Top-Left Two-Screen Recent Apps Icon
+        drawTwoScreensIcon(canvas, cx - topCornerMidOffset, rowCenters[0], h * 0.030f)
+
+        // #10 & #11: Top-Right Compass Heading + Thermometer Icon + Clean Temperature
+        drawTopRightCompassAndTemp(canvas, cx + topCornerMidOffset, rowCenters[0], h)
+
+        // Bottom-Left Voice Microphone Icon
+        drawVoiceIcon(canvas, cx - botCornerMidOffset, rowCenters[4], h * 0.032f)
+
+        // Bottom-Right Dual Settings Gears
+        val gearSpacing = h * 0.045f
+        drawGearIcon(canvas, cx + botCornerMidOffset - gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
+        drawGearIcon(canvas, cx + botCornerMidOffset + gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
     }
 
-    private fun drawInnerRing(canvas: Canvas, cx: Float, cy: Float, rHub: Float, rInner: Float) {
-        val h = height.toFloat()
+    private fun drawInnerRing(canvas: Canvas, cx: Float, cy: Float, h: Float, rHub: Float, rInner: Float) {
+        // Dark separator groove around inner ring
+        groovePaint.strokeWidth = 12f
+        canvas.drawCircle(cx, cy, rInner, groovePaint)
 
-        // Dark spacer ring outside inner ring
-        strokePaint.strokeWidth = 14f
-        strokePaint.color = bgDark
-        canvas.drawCircle(cx, cy, rInner, strokePaint)
-
-        // Req 2: Fill inner ring with 20% lighter gray (#5C6270)
+        // #2: 35% Lighter Gray Inner Ring Fill
         fillPaint.color = innerRingColor
-        canvas.drawCircle(cx, cy, rInner - 6f, fillPaint)
+        canvas.drawCircle(cx, cy, rInner - 4f, fillPaint)
 
-        // Inside dotted circle boundary
-        canvas.drawCircle(cx, cy, rInner + 2f, dashedPaint)
+        // Stitching circle around inner ring
+        canvas.drawCircle(cx, cy, rInner + 4f, stitchPaint)
 
-        // Dark radial dividers separating Top Arc, Bottom Arc, Left Icons, Right Icons
-        strokePaint.strokeWidth = 10f
-        strokePaint.color = bgDark
+        // Diagonal radial dividers separating Top Arc, Bottom Arc, Left Icons, Right Icons
+        groovePaint.strokeWidth = 10f
         val angles = floatArrayOf(42f, 138f, 222f, 318f)
         for (deg in angles) {
             val rad = Math.toRadians(deg.toDouble())
@@ -360,17 +466,20 @@ class AgamaDashboardView(
             val yStart = cy + rHub * sin(rad).toFloat()
             val xEnd = cx + rInner * cos(rad).toFloat()
             val yEnd = cy + rInner * sin(rad).toFloat()
-            canvas.drawLine(xStart, yStart, xEnd, yEnd, strokePaint)
+            canvas.drawLine(xStart, yStart, xEnd, yEnd, groovePaint)
+            canvas.drawLine(xStart, yStart, xEnd, yEnd, stitchPaint)
         }
 
-        // Dark-only separators between the 3 icons on left and right of inner ring
+        // Horizontal stitch dividers inside the Left & Right inner icon rings
         for (y in floatArrayOf(h * 0.39f, h * 0.61f)) {
             val dy = abs(y - cy)
             if (dy < rInner) {
                 val dxOuter = sqrt(rInner * rInner - dy * dy)
                 val dxInner = if (dy < rHub) sqrt(rHub * rHub - dy * dy) else 0f
-                canvas.drawLine(cx - dxOuter, y, cx - dxInner, y, strokePaint)
-                canvas.drawLine(cx + dxInner, y, cx + dxOuter, y, strokePaint)
+                canvas.drawLine(cx - dxOuter, y, cx - dxInner, y, groovePaint)
+                canvas.drawLine(cx - dxOuter + 3f, y, cx - dxInner - 3f, y, stitchPaint)
+                canvas.drawLine(cx + dxInner, y, cx + dxOuter, y, groovePaint)
+                canvas.drawLine(cx + dxInner + 3f, y, cx + dxOuter - 3f, y, stitchPaint)
             }
         }
 
@@ -381,7 +490,7 @@ class AgamaDashboardView(
         val dayFormat = SimpleDateFormat("EEEE", Locale.US)
         val now = Date()
 
-        drawRedOutlinedText(canvas, dateFormat.format(now), cx, cy - rMid - h * 0.01f, h * 0.033f)
+        drawRedOutlinedText(canvas, dateFormat.format(now), cx, cy - rMid - h * 0.01f, h * 0.032f)
 
         textPaint.textSize = h * 0.026f
         textPaint.color = secondaryColor
@@ -389,51 +498,80 @@ class AgamaDashboardView(
 
         val volAngleLeft = Math.toRadians(242.0)
         val volAngleRight = Math.toRadians(298.0)
-        drawRedOutlinedText(canvas, "-", cx + rMid * cos(volAngleLeft).toFloat(), cy + rMid * sin(volAngleLeft).toFloat() + 14f, h * 0.055f)
-        drawRedOutlinedText(canvas, "+", cx + rMid * cos(volAngleRight).toFloat(), cy + rMid * sin(volAngleRight).toFloat() + 14f, h * 0.055f)
+        drawRedOutlinedText(canvas, "-", cx + rMid * cos(volAngleLeft).toFloat(), cy + rMid * sin(volAngleLeft).toFloat() + 14f, h * 0.054f)
+        drawRedOutlinedText(canvas, "+", cx + rMid * cos(volAngleRight).toFloat(), cy + rMid * sin(volAngleRight).toFloat() + 14f, h * 0.054f)
 
-        // BOTTOM ARC: < (Prev), Music Player / Play, > (Next)
-        drawRedOutlinedText(canvas, "Music Player", cx, cy + rMid - h * 0.005f, h * 0.032f)
+        // BOTTOM ARC: < (Prev), Music Player / Scrolling Song Info, > (Next)
+        drawRedOutlinedText(canvas, "Music Player", cx, cy + rMid - h * 0.006f, h * 0.031f)
 
-        textPaint.textSize = h * 0.030f
-        textPaint.color = secondaryColor
-        canvas.drawText(if (isPlayingState) "Playing" else "Play", cx, cy + rMid + h * 0.038f, textPaint)
+        // Scrolling Song Title / Artist Ticker when playing
+        drawBottomMediaSubtext(canvas, cx, cy + rMid + h * 0.036f, rHub * 0.62f, h * 0.028f)
 
         val mediaAngleLeft = Math.toRadians(118.0)
         val mediaAngleRight = Math.toRadians(62.0)
-        drawRedOutlinedText(canvas, "<", cx + rMid * cos(mediaAngleLeft).toFloat(), cy + rMid * sin(mediaAngleLeft).toFloat() + 12f, h * 0.052f)
-        drawRedOutlinedText(canvas, ">", cx + rMid * cos(mediaAngleRight).toFloat(), cy + rMid * sin(mediaAngleRight).toFloat() + 12f, h * 0.052f)
+        drawRedOutlinedText(canvas, "<", cx + rMid * cos(mediaAngleLeft).toFloat(), cy + rMid * sin(mediaAngleLeft).toFloat() + 12f, h * 0.050f)
+        drawRedOutlinedText(canvas, ">", cx + rMid * cos(mediaAngleRight).toFloat(), cy + rMid * sin(mediaAngleRight).toFloat() + 12f, h * 0.050f)
 
-        // LEFT & RIGHT INNER RING ICONS (Customizable via Long-Press)
+        // LEFT & RIGHT INNER RING ICONS (Customizable via Long-Press #3)
         val iconSize = h * 0.031f
-        drawCustomSlotIcon(canvas, "RADIO", 0, cx - rMid * 0.92f, h * 0.29f, iconSize, primaryColor)
-        drawCustomSlotIcon(canvas, "CARPLAY", 1, cx - rMid, h * 0.50f, iconSize, primaryColor)
-        drawCustomSlotIcon(canvas, "MUSIC", 2, cx - rMid * 0.92f, h * 0.71f, iconSize, primaryColor)
+        drawCustomSlotIcon(canvas, "RADIO", 0, cx - rMid * 0.92f, h * 0.29f, iconSize)
+        drawCustomSlotIcon(canvas, "CARPLAY", 1, cx - rMid, h * 0.50f, iconSize)
+        drawCustomSlotIcon(canvas, "MUSIC", 2, cx - rMid * 0.92f, h * 0.71f, iconSize)
 
-        drawCustomSlotIcon(canvas, "PHONE", 3, cx + rMid * 0.92f, h * 0.29f, iconSize, primaryColor)
-        drawCustomSlotIcon(canvas, "INTERNET", 4, cx + rMid, h * 0.50f, iconSize, primaryColor)
-        drawCustomSlotIcon(canvas, "APPS", 5, cx + rMid * 0.92f, h * 0.71f, iconSize, primaryColor)
+        drawCustomSlotIcon(canvas, "PHONE", 3, cx + rMid * 0.92f, h * 0.29f, iconSize)
+        drawCustomSlotIcon(canvas, "INTERNET", 4, cx + rMid, h * 0.50f, iconSize)
+        drawCustomSlotIcon(canvas, "APPS", 5, cx + rMid * 0.92f, h * 0.71f, iconSize)
     }
 
-    // Req 7, 8, 9: Draw the 4 blue corner items outside the outer dotted line
-    private fun drawCornerPodsOutsideDottedLine(canvas: Canvas, w: Float, h: Float) {
-        val leftCornerX = w * 0.105f
-        val rightCornerX = w * 0.895f
-        val topCornerY = h * 0.095f
-        val botCornerY = h * 0.905f
+    private fun drawBottomMediaSubtext(canvas: Canvas, cx: Float, y: Float, halfWidth: Float, textSize: Float) {
+        textPaint.textSize = textSize
+        textPaint.color = secondaryColor
 
-        // Top-Left Corner (Outside Dotted Line): Wi-Fi + GPS Satellite & Count
-        drawTopLeftStatus(canvas, leftCornerX, topCornerY, h)
+        val active = audioManager.isMusicActive || isPlayingState
+        if (!active) {
+            canvas.drawText("Play", cx, y, textPaint)
+            return
+        }
 
-        // Top-Right Corner (Outside Dotted Line): Blue Compass Circle (N, NE, E...) + Temp
-        drawTopRightStatus(canvas, rightCornerX, topCornerY, h)
+        val tickerText = if (currentSongInfo.isNotEmpty()) {
+            "$currentSongInfo     •     "
+        } else {
+            "Playing Audio Stream     •     "
+        }
 
-        // Bottom-Left Corner (Outside Dotted Line): Two-Screen Recents Icon
-        drawTwoScreensIcon(canvas, leftCornerX, botCornerY, h * 0.034f)
+        val textWidth = textPaint.measureText(tickerText)
+        if (textWidth <= 0f) {
+            canvas.drawText("Playing", cx, y, textPaint)
+            return
+        }
 
-        // Bottom-Right Corner (Outside Dotted Line): Dual Settings Gears
-        drawGearIcon(canvas, rightCornerX - h * 0.055f, botCornerY, h * 0.030f, secondaryColor)
-        drawGearIcon(canvas, rightCornerX + h * 0.055f, botCornerY, h * 0.030f, secondaryColor)
+        canvas.save()
+        canvas.clipRect(cx - halfWidth, y - textSize * 1.2f, cx + halfWidth, y + textSize * 0.4f)
+        textPaint.textAlign = Paint.Align.LEFT
+        val offset = scrollXOffset % textWidth
+        val startX = (cx - halfWidth) - offset
+        canvas.drawText(tickerText, startX, y, textPaint)
+        canvas.drawText(tickerText, startX + textWidth, y, textPaint)
+        textPaint.textAlign = Paint.Align.CENTER
+        canvas.restore()
+    }
+
+    private fun drawCustomSlotIcon(canvas: Canvas, slotKey: String, defaultType: Int, cx: Float, cy: Float, s: Float) {
+        val type = prefs.getInt("icon_$slotKey", defaultType)
+        when (type) {
+            0 -> drawRadioIcon(canvas, cx, cy, s, primaryColor)
+            1 -> drawCarPlayIcon(canvas, cx, cy, s, primaryColor)
+            2 -> drawMusicIcon(canvas, cx, cy, s, primaryColor)
+            3 -> drawPhoneIcon(canvas, cx, cy, s, primaryColor)
+            4 -> drawGlobeIcon(canvas, cx, cy, s, primaryColor)
+            5 -> drawAppsGridIcon(canvas, cx, cy, s, primaryColor)
+            6 -> drawNavArrowIcon(canvas, cx, cy, s, primaryColor)
+            7 -> drawBluetoothIcon(canvas, cx, cy, s, primaryColor)
+            8 -> drawEqualizerIcon(canvas, cx, cy, s, primaryColor)
+            9 -> drawCameraIcon(canvas, cx, cy, s, primaryColor)
+            10 -> drawGaugeIcon(canvas, cx, cy, s, primaryColor)
+            else -> drawFolderIcon(canvas, cx, cy, s, primaryColor)
+        }
     }
 
     private fun drawCentralHub(canvas: Canvas, cx: Float, cy: Float, rHub: Float) {
@@ -443,9 +581,7 @@ class AgamaDashboardView(
         fillPaint.color = hubBgColor
         canvas.drawCircle(cx, cy, rHub, fillPaint)
 
-        strokePaint.strokeWidth = 3f
-        strokePaint.color = Color.parseColor("#2E3440")
-        canvas.drawCircle(cx, cy, rHub - 4f, strokePaint)
+        canvas.drawCircle(cx, cy, rHub + 2f, stitchPaint)
 
         when (centerMode) {
             0 -> drawGlossySubaruBadge(canvas, cx, cy, rHub * 0.80f, rHub * 0.44f)
@@ -462,7 +598,7 @@ class AgamaDashboardView(
                 canvas.drawText(timeFmt.format(Date()), cx, cy + rHub * 0.08f, textPaint)
                 textPaint.color = secondaryColor
                 textPaint.textSize = rHub * 0.16f
-                canvas.drawText("$currentMph MPH • $currentCompass", cx, cy + rHub * 0.42f, textPaint)
+                canvas.drawText("$currentMph MPH • $compassDir", cx, cy + rHub * 0.42f, textPaint)
             }
         }
     }
@@ -527,34 +663,7 @@ class AgamaDashboardView(
         canvas.drawPath(path, fillPaint)
     }
 
-    // --- Customizable Standard Icon Renderer ---
-    private fun drawCustomSlotIcon(
-        canvas: Canvas,
-        slotKey: String,
-        defaultType: Int,
-        cx: Float,
-        cy: Float,
-        s: Float,
-        color: Int
-    ) {
-        val type = prefs.getInt("icon_$slotKey", defaultType)
-        when (type) {
-            0 -> drawRadioIcon(canvas, cx, cy, s, color)
-            1 -> drawCarPlayIcon(canvas, cx, cy, s, color)
-            2 -> drawMusicIcon(canvas, cx, cy, s, color)
-            3 -> drawPhoneIcon(canvas, cx, cy, s, color)
-            4 -> drawGlobeIcon(canvas, cx, cy, s, color)
-            5 -> drawAppsGridIcon(canvas, cx, cy, s, color)
-            6 -> drawNavArrowIcon(canvas, cx, cy, s, color)
-            7 -> drawBluetoothIcon(canvas, cx, cy, s, color)
-            8 -> drawEqualizerIcon(canvas, cx, cy, s, color)
-            9 -> drawCameraIcon(canvas, cx, cy, s, color)
-            10 -> drawGaugeIcon(canvas, cx, cy, s, color)
-            11 -> drawVideoIcon(canvas, cx, cy, s, color)
-            else -> drawRadioIcon(canvas, cx, cy, s, color)
-        }
-    }
-
+    // --- Vector Icon Helpers (With Thinner White Outlines #12) ---
     private fun drawRadioIcon(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
         val rect = RectF(cx - s, cy - s * 0.6f, cx + s, cy + s * 0.8f)
         for (p in arrayOf(iconWhiteOutlinePaint, iconPaint.apply { this.color = color })) {
@@ -658,9 +767,9 @@ class AgamaDashboardView(
             canvas.drawLine(cx + s * 0.6f, cy - s * 0.8f, cx + s * 0.6f, cy + s * 0.8f, p)
         }
         fillPaint.color = color
-        canvas.drawCircle(cx - s * 0.6f, cy - s * 0.25f, s * 0.22f, fillPaint)
-        canvas.drawCircle(cx, cy + s * 0.3f, s * 0.22f, fillPaint)
-        canvas.drawCircle(cx + s * 0.6f, cy - s * 0.4f, s * 0.22f, fillPaint)
+        canvas.drawCircle(cx - s * 0.6f, cy - s * 0.2f, s * 0.24f, fillPaint)
+        canvas.drawCircle(cx, cy + s * 0.3f, s * 0.24f, fillPaint)
+        canvas.drawCircle(cx + s * 0.6f, cy - s * 0.4f, s * 0.24f, fillPaint)
     }
 
     private fun drawCameraIcon(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
@@ -675,33 +784,76 @@ class AgamaDashboardView(
         val rect = RectF(cx - s * 0.9f, cy - s * 0.8f, cx + s * 0.9f, cy + s * 0.9f)
         for (p in arrayOf(iconWhiteOutlinePaint, iconPaint.apply { this.color = color })) {
             canvas.drawArc(rect, 150f, 240f, false, p)
-            canvas.drawLine(cx, cy + s * 0.1f, cx + s * 0.5f, cy - s * 0.45f, p)
+            canvas.drawLine(cx, cy + s * 0.1f, cx + s * 0.5f, cy - s * 0.4f, p)
         }
     }
 
-    private fun drawVideoIcon(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
-        val rect = RectF(cx - s * 0.9f, cy - s * 0.65f, cx + s * 0.45f, cy + s * 0.65f)
+    private fun drawFolderIcon(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
+        val rect = RectF(cx - s * 0.9f, cy - s * 0.45f, cx + s * 0.9f, cy + s * 0.75f)
         for (p in arrayOf(iconWhiteOutlinePaint, iconPaint.apply { this.color = color })) {
             canvas.drawRoundRect(rect, 6f, 6f, p)
-            canvas.drawLine(cx + s * 0.45f, cy - s * 0.2f, cx + s * 0.95f, cy - s * 0.55f, p)
-            canvas.drawLine(cx + s * 0.95f, cy - s * 0.55f, cx + s * 0.95f, cy + s * 0.55f, p)
-            canvas.drawLine(cx + s * 0.95f, cy + s * 0.55f, cx + s * 0.45f, cy + s * 0.2f, p)
+            canvas.drawLine(cx - s * 0.8f, cy - s * 0.65f, cx - s * 0.1f, cy - s * 0.65f, p)
         }
     }
 
-    // Req 8: Bottom-left Two-Screen overlapping icon for Recent / Opened Apps
+    // #9: Two-Screen Overlapping Rectangles Icon (Recent Apps)
     private fun drawTwoScreensIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
         iconPaint.color = secondaryColor
-        val backScreen = RectF(cx - s * 0.85f, cy - s * 0.75f, cx + s * 0.35f, cy + s * 0.25f)
-        val frontScreen = RectF(cx - s * 0.35f, cy - s * 0.25f, cx + s * 0.85f, cy + s * 0.75f)
-        canvas.drawRoundRect(backScreen, 6f, 6f, iconPaint)
-        fillPaint.color = bgDark
-        canvas.drawRoundRect(frontScreen, 6f, 6f, fillPaint)
-        canvas.drawRoundRect(frontScreen, 6f, 6f, iconPaint)
+        // Front screen rectangle
+        val front = RectF(cx - s * 0.95f, cy - s * 0.45f, cx + s * 0.45f, cy + s * 0.75f)
+        canvas.drawRoundRect(front, 6f, 6f, iconPaint)
+        // Rear overlapping screen
+        val backPath = Path().apply {
+            moveTo(cx - s * 0.35f, cy - s * 0.45f)
+            lineTo(cx - s * 0.35f, cy - s * 0.85f)
+            lineTo(cx + s * 0.95f, cy - s * 0.85f)
+            lineTo(cx + s * 0.95f, cy + s * 0.35f)
+            lineTo(cx + s * 0.45f, cy + s * 0.35f)
+        }
+        canvas.drawPath(backPath, iconPaint)
+    }
+
+    // #10 & #11: Compass Direction + Thermometer Icon + Clean Temperature without "+"
+    private fun drawTopRightCompassAndTemp(canvas: Canvas, cx: Float, cy: Float, h: Float) {
+        // 1. Compass Badge with N, NE, E, SE, S, SW, W, NW
+        val compX = cx - h * 0.088f
+        val compRadius = h * 0.032f
+        iconPaint.color = secondaryColor
+        iconPaint.strokeWidth = 3f
+        canvas.drawCircle(compX, cy, compRadius, iconPaint)
+        textPaint.textSize = h * 0.025f
+        textPaint.color = secondaryColor
+        canvas.drawText(compassDir, compX, cy + h * 0.009f, textPaint)
+
+        // 2. Vector Thermometer Icon in front of temperature
+        val thermX = cx - h * 0.022f
+        val rBulb = h * 0.013f
+        fillPaint.color = secondaryColor
+        canvas.drawCircle(thermX, cy + h * 0.014f, rBulb, fillPaint)
+        iconPaint.strokeWidth = 4.2f
+        canvas.drawLine(thermX, cy + h * 0.010f, thermX, cy - h * 0.024f, iconPaint)
+        // Thermometer degree tick marks
+        canvas.drawLine(thermX + 4f, cy - h * 0.018f, thermX + 10f, cy - h * 0.018f, iconPaint)
+        canvas.drawLine(thermX + 4f, cy - h * 0.006f, thermX + 10f, cy - h * 0.006f, iconPaint)
+
+        // 3. Temperature text (no "+" when above freezing)
+        textPaint.textSize = h * 0.040f
+        textPaint.color = secondaryColor
+        val tempStr = "${temperatureF}°"
+        canvas.drawText(tempStr, cx + h * 0.052f, cy + h * 0.015f, textPaint)
+    }
+
+    private fun drawVoiceIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
+        iconPaint.color = secondaryColor
+        iconPaint.strokeWidth = 4.2f
+        canvas.drawRoundRect(RectF(cx - s * 0.35f, cy - s * 0.8f, cx + s * 0.35f, cy + s * 0.2f), 12f, 12f, iconPaint)
+        canvas.drawArc(RectF(cx - s * 0.7f, cy - s * 0.5f, cx + s * 0.7f, cy + s * 0.55f), 0f, 180f, false, iconPaint)
+        canvas.drawLine(cx, cy + s * 0.55f, cx, cy + s * 0.95f, iconPaint)
     }
 
     private fun drawGearIcon(canvas: Canvas, cx: Float, cy: Float, r: Float, color: Int) {
         iconPaint.color = color
+        iconPaint.strokeWidth = 4.2f
         canvas.drawCircle(cx, cy, r * 0.55f, iconPaint)
         for (i in 0 until 8) {
             val a = Math.toRadians((i * 45).toDouble())
@@ -713,36 +865,6 @@ class AgamaDashboardView(
                 iconPaint
             )
         }
-    }
-
-    private fun drawTopLeftStatus(canvas: Canvas, cx: Float, cy: Float, h: Float) {
-        iconPaint.color = secondaryColor
-        canvas.drawLine(cx - 18f, cy - 12f, cx + 12f, cy + 18f, iconPaint)
-        canvas.drawCircle(cx - 3f, cy + 3f, 8f, iconPaint)
-        textPaint.textSize = h * 0.028f
-        textPaint.color = secondaryColor
-        canvas.drawText(satelliteCount.toString(), cx + 32f, cy + 2f, textPaint)
-    }
-
-    // Req 9: Solid blue circle displays live compass heading (N, NE, E, SE, S, SW, W, NW)
-    private fun drawTopRightStatus(canvas: Canvas, cx: Float, cy: Float, h: Float) {
-        val badgeRadius = h * 0.032f
-        val badgeX = cx - h * 0.065f
-        val badgeY = cy
-
-        fillPaint.color = secondaryColor
-        canvas.drawCircle(badgeX, badgeY, badgeRadius, fillPaint)
-
-        // Compass text inside the solid blue circle
-        textPaint.textSize = h * 0.024f
-        textPaint.color = Color.WHITE
-        canvas.drawText(currentCompass, badgeX, badgeY + h * 0.009f, textPaint)
-
-        // Temperature readout to the right of the blue compass dot
-        textPaint.textSize = h * 0.038f
-        textPaint.color = secondaryColor
-        val readout = if (currentMph > 0) "$currentMph MPH" else "+59°"
-        canvas.drawText(readout, cx + h * 0.035f, cy + h * 0.013f, textPaint)
     }
 
     // --- Touch & Long-Press Detection ---
@@ -787,13 +909,12 @@ class AgamaDashboardView(
         val dy = y - cy
         val dist = hypot(dx, dy)
 
-        val rHub = h * 0.28f
-        val rInner = h * 0.45f
+        val rHub = h * 0.29f
+        val rInner = h * 0.465f
 
-        // 1. Center Hub
         if (dist <= rHub) return "CENTER_HUB"
 
-        // 2. Inner Ring (Separates ICON_ slots from WING_ text slots)
+        // Inner Ring: Distinguishes ICON_* touches (#3) from outer WING_* text touches (#5)
         if (dist <= rInner) {
             val angle = (Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())) + 360) % 360
             return when {
@@ -828,26 +949,26 @@ class AgamaDashboardView(
             }
         }
 
-        // 3. Outer Corners & Wing Text Slots
+        // Outer Curved Wings
         val isLeft = x < cx
         return when {
-            y < h * 0.19f -> if (isLeft) "STATUS_LEFT" else "STATUS_RIGHT"
+            y < h * 0.19f -> if (isLeft) "RECENTS_TOP_LEFT" else "TEMP_TOP_RIGHT"
             y < h * 0.39f -> if (isLeft) "WING_RADIO" else "WING_PHONE"
             y < h * 0.61f -> if (isLeft) "WING_CARPLAY" else "WING_INTERNET"
             y < h * 0.81f -> if (isLeft) "WING_MUSIC" else "WING_APPS"
             else -> {
-                if (isLeft) "RECENTS_TWO_SCREENS"
+                if (isLeft) "VOICE"
                 else {
-                    val rightCornerCenter = w * 0.895f
-                    if (x < rightCornerCenter) "GEAR_SKIN" else "GEAR_HOME"
+                    val botCornerMid = cx + (getDxInner(h * 0.905f, cy, rInner + 4f) + getDxOuter(h * 0.905f, cy, w * 0.47f, h * 0.58f)) / 2f
+                    if (x < botCornerMid) "GEAR_SKIN" else "GEAR_HOME"
                 }
             }
         }
     }
 
     private fun handleZoneAction(zone: String, isLongPress: Boolean) {
-        when {
-            zone == "CENTER_HUB" -> {
+        when (zone) {
+            "CENTER_HUB" -> {
                 if (isLongPress) {
                     LauncherUtils.openHomeSettings(context)
                 } else {
@@ -856,52 +977,93 @@ class AgamaDashboardView(
                     invalidate()
                 }
             }
-            zone == "VOL_DOWN" -> audioManager.adjustStreamVolume(
+            "VOL_DOWN" -> audioManager.adjustStreamVolume(
                 AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI
             )
-            zone == "VOL_UP" -> audioManager.adjustStreamVolume(
+            "VOL_UP" -> audioManager.adjustStreamVolume(
                 AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI
             )
-            zone == "MEDIA_PREV" -> mediaHelper.prevTrack()
-            zone == "MEDIA_NEXT" -> mediaHelper.nextTrack()
-            zone == "MEDIA_PLAY" -> {
+            "MEDIA_PREV" -> mediaHelper.prevTrack()
+            "MEDIA_NEXT" -> mediaHelper.nextTrack()
+            "MEDIA_PLAY" -> {
                 mediaHelper.playPause()
-                togglePlayText()
+                togglePlayState()
             }
-            // Req 3: Long-pressing an inner icon opens the standard icon picker
-            zone.startsWith("ICON_") -> {
+            "RECENTS_TOP_LEFT" -> openRecentApps()
+            "TEMP_TOP_RIGHT" -> showTemperatureDialog()
+
+            // #3: Long-press on any red inner-ring icon opens the Standard Icon Picker
+            "ICON_RADIO", "ICON_CARPLAY", "ICON_MUSIC", "ICON_PHONE", "ICON_INTERNET", "ICON_APPS" -> {
                 val slotKey = zone.removePrefix("ICON_")
                 if (isLongPress) {
                     showIconPickerDialog(slotKey)
                 } else if (slotKey == "APPS") {
-                    showVisualAllAppsGrid()
+                    showVisualAppDrawer(assignToSlot = null)
                 } else {
                     launchAssignedApp(slotKey)
                 }
             }
-            // Req 5: Long-pressing the outer written text opens the label editor & app picker
-            zone.startsWith("WING_") -> {
+
+            // #5 & #6: Long-press on any outer red word opens the Keyboard Rename + App Picker Dialog
+            "WING_RADIO", "WING_CARPLAY", "WING_MUSIC", "WING_PHONE", "WING_INTERNET", "WING_APPS" -> {
                 val slotKey = zone.removePrefix("WING_")
                 if (isLongPress) {
-                    showEditTextAndAppDialog(slotKey)
+                    showRenameAndAssignDialog(slotKey)
                 } else if (slotKey == "APPS") {
-                    showVisualAllAppsGrid()
+                    showVisualAppDrawer(assignToSlot = null)
                 } else {
                     launchAssignedApp(slotKey)
                 }
             }
-            // Req 8: Bottom-left Two-Screen icon pulls up swipeable Opened Apps
-            zone == "RECENTS_TWO_SCREENS" -> showSwipeableOpenedAppsDialog()
-            zone == "GEAR_SKIN" -> showSkinCustomizerDialog()
-            zone == "GEAR_HOME" -> showEscapeHatchDialog()
+
+            "VOICE" -> {
+                try {
+                    context.startActivity(Intent(Intent.ACTION_VOICE_COMMAND).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                } catch (_: Exception) {
+                    showVisualAppDrawer(assignToSlot = "VOICE")
+                }
+            }
+            "GEAR_SKIN" -> showSkinCustomizerDialog()
+            "GEAR_HOME" -> showEscapeHatchDialog()
         }
     }
 
-    // Req 3: Standard Icon Replacer Dialog
+    // #9: Triggers Android's Recent Apps (Multitasking Swipe-to-Close Carousel)
+    private fun openRecentApps() {
+        // Method 1: SystemUI Recents Toggle Broadcast (Supported on most XYAuto / Android head units)
+        try {
+            context.sendBroadcast(Intent("com.android.systemui.recents.TOGGLE_RECENTS"))
+            context.sendBroadcast(Intent("com.xyauto.broadcast.RECENTS"))
+        } catch (_: Exception) {}
+
+        // Method 2: Direct SystemUI RecentsActivity Intent
+        val recentsComponents = listOf(
+            ComponentName("com.android.systemui", "com.android.systemui.recents.RecentsActivity"),
+            ComponentName("com.android.systemui", "com.android.quickstep.RecentsActivity"),
+            ComponentName("com.android.launcher3", "com.android.quickstep.RecentsActivity")
+        )
+        for (comp in recentsComponents) {
+            try {
+                val intent = Intent(Intent.ACTION_MAIN).apply {
+                    component = comp
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                context.startActivity(intent)
+                return
+            } catch (_: Exception) {}
+        }
+
+        // Method 3: Dispatch Hardware APP_SWITCH Keycode (Keycode 187)
+        try {
+            Runtime.getRuntime().exec("input keyevent 187")
+        } catch (_: Exception) {}
+    }
+
+    // #3: Standard Icon Picker for Inner Red Icons
     private fun showIconPickerDialog(slotKey: String) {
         AlertDialog.Builder(context)
             .setTitle("Select Icon for $slotKey")
-            .setItems(iconNames) { _, which ->
+            .setItems(iconTypeNames) { _, which ->
                 prefs.edit().putInt("icon_$slotKey", which).apply()
                 invalidate()
             }
@@ -909,99 +1071,62 @@ class AgamaDashboardView(
             .show()
     }
 
-    // Req 5: Written Text Label Editor + App Assignment Dialog
-    private fun showEditTextAndAppDialog(slotKey: String) {
+    // #5: Pop-up Keyboard Dialog to Rename Wing Text & Assign App
+    private fun showRenameAndAssignDialog(slotKey: String) {
         val currentLabel = prefs.getString("label_$slotKey", slotKey) ?: slotKey
         val input = EditText(context).apply {
             setText(currentLabel)
-            setSelection(currentLabel.length)
-            hint = "Enter button text"
-            setPadding(48, 32, 48, 32)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+            setSelection(text.length)
+            setPadding(45, 35, 45, 35)
         }
 
-        AlertDialog.Builder(context)
-            .setTitle("Customize $slotKey Text & App")
+        val dialog = AlertDialog.Builder(context)
+            .setTitle("Customize $slotKey Button")
+            .setMessage("Enter custom text label or choose which app this button opens:")
             .setView(input)
             .setPositiveButton("Save Text") { _, _ ->
-                val newText = input.text.toString().trim().uppercase(Locale.US)
+                val newText = input.text.toString().trim()
                 if (newText.isNotEmpty()) {
                     prefs.edit().putString("label_$slotKey", newText).apply()
                     invalidate()
                 }
             }
-            .setNeutralButton("Save Text & Pick App") { _, _ ->
-                val newText = input.text.toString().trim().uppercase(Locale.US)
+            .setNeutralButton("Save & Pick App") { _, _ ->
+                val newText = input.text.toString().trim()
                 if (newText.isNotEmpty()) {
                     prefs.edit().putString("label_$slotKey", newText).apply()
                     invalidate()
                 }
-                showAppPickerDialog(slotKey)
+                showVisualAppDrawer(assignToSlot = slotKey)
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .create()
+
+        dialog.show()
+        input.requestFocus()
+        input.postDelayed({
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+        }, 150L)
     }
 
-    private fun launchAssignedApp(slotKey: String) {
-        val pkg = prefs.getString("pkg_$slotKey", null)
-        if (pkg != null) {
-            val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
-            if (launchIntent != null) {
-                openedPackages.add(pkg)
-                context.startActivity(launchIntent)
-                return
-            }
-        }
-        Toast.makeText(context, "Pick an app for $slotKey", Toast.LENGTH_SHORT).show()
-        showAppPickerDialog(slotKey)
-    }
-
-    private fun showAppPickerDialog(slotKey: String) {
+    // #6: Visual App Drawer Grid with Installed Android Application Icons
+    private fun showVisualAppDrawer(assignToSlot: String?) {
         val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
-        val apps = pm.queryIntentActivities(mainIntent, 0).sortedBy { it.loadLabel(pm).toString() }
-        val names = apps.map { it.loadLabel(pm).toString() }.toTypedArray()
-
-        AlertDialog.Builder(context)
-            .setTitle("Assign App to $slotKey")
-            .setItems(names) { _, which ->
-                val chosenPackage = apps[which].activityInfo.packageName
-                prefs.edit().putString("pkg_$slotKey", chosenPackage).apply()
-                Toast.makeText(context, "$slotKey mapped to ${names[which]}", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    // Req 6: Visual All-Apps Grid with App Icons (Click to Open, Long-Press to Place on Launcher)
-    private fun showVisualAllAppsGrid() {
-        val pm = context.packageManager
-        val mainIntent = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
-        val apps = pm.queryIntentActivities(mainIntent, 0).sortedBy { it.loadLabel(pm).toString() }
-
-        val container = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(24, 20, 24, 20)
-        }
-
-        val subtitle = TextView(context).apply {
-            text = "Tap any app icon to open it • Long-press any app icon to place it on a launcher button"
-            setTextColor(Color.parseColor("#A0AAB8"))
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setPadding(8, 4, 8, 16)
-        }
-        container.addView(subtitle)
+        val apps = pm.queryIntentActivities(mainIntent, 0).sortedBy { it.loadLabel(pm).toString().lowercase() }
 
         val gridView = GridView(context).apply {
             numColumns = 5
-            verticalSpacing = 24
-            horizontalSpacing = 16
+            verticalSpacing = 28
+            horizontalSpacing = 20
+            setPadding(32, 32, 32, 32)
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
-            selector = ColorDrawable(Color.TRANSPARENT)
+            setBackgroundColor(Color.parseColor("#181C24"))
         }
 
-        var dialog: AlertDialog? = null
+        lateinit var alertDialog: AlertDialog
 
         val adapter = object : BaseAdapter() {
             override fun getCount(): Int = apps.size
@@ -1009,26 +1134,30 @@ class AgamaDashboardView(
             override fun getItemId(position: Int): Long = position.toLong()
 
             override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-                val info = apps[position]
                 val itemLayout = LinearLayout(context).apply {
                     orientation = LinearLayout.VERTICAL
                     gravity = Gravity.CENTER
                     setPadding(12, 16, 12, 16)
                 }
 
+                val appInfo = apps[position]
                 val iconView = ImageView(context).apply {
                     layoutParams = LinearLayout.LayoutParams(96, 96)
                     scaleType = ImageView.ScaleType.FIT_CENTER
-                    setImageDrawable(info.loadIcon(pm))
+                    setImageDrawable(appInfo.loadIcon(pm))
                 }
 
                 val labelView = TextView(context).apply {
-                    text = info.loadLabel(pm).toString()
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                    text = appInfo.loadLabel(pm).toString()
                     setTextColor(Color.WHITE)
                     textSize = 12f
+                    gravity = Gravity.CENTER
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
-                    gravity = Gravity.CENTER
                     setPadding(0, 8, 0, 0)
                 }
 
@@ -1039,224 +1168,62 @@ class AgamaDashboardView(
         }
 
         gridView.adapter = adapter
-
         gridView.setOnItemClickListener { _, _, position, _ ->
-            val pkg = apps[position].activityInfo.packageName
-            pm.getLaunchIntentForPackage(pkg)?.let {
-                openedPackages.add(pkg)
-                dialog?.dismiss()
-                context.startActivity(it)
+            val chosenPkg = apps[position].activityInfo.packageName
+            val chosenName = apps[position].loadLabel(pm).toString()
+            alertDialog.dismiss()
+
+            if (assignToSlot != null) {
+                prefs.edit().putString("pkg_$assignToSlot", chosenPkg).apply()
+                Toast.makeText(context, "$assignToSlot assigned to $chosenName", Toast.LENGTH_SHORT).show()
+                pm.getLaunchIntentForPackage(chosenPkg)?.let { context.startActivity(it) }
+            } else {
+                pm.getLaunchIntentForPackage(chosenPkg)?.let { context.startActivity(it) }
             }
         }
 
-        gridView.setOnItemLongClickListener { _, _, position, _ ->
-            val appInfo = apps[position]
-            val appLabel = appInfo.loadLabel(pm).toString()
-            val appPkg = appInfo.activityInfo.packageName
-            val slots = wingKeys.toTypedArray()
-
-            AlertDialog.Builder(context)
-                .setTitle("Place '$appLabel' on which Launcher Slot?")
-                .setItems(slots) { _, which ->
-                    val targetSlot = slots[which]
-                    prefs.edit()
-                        .putString("pkg_$targetSlot", appPkg)
-                        .putString("label_$targetSlot", appLabel.uppercase(Locale.US))
-                        .apply()
-                    invalidate()
-                    Toast.makeText(context, "$appLabel placed on $targetSlot", Toast.LENGTH_SHORT).show()
-                    dialog?.dismiss()
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-            true
-        }
-
-        container.addView(
-            gridView,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        )
-
-        dialog = AlertDialog.Builder(context)
-            .setTitle("All Installed Apps")
-            .setView(container)
+        val title = if (assignToSlot != null) "Select App for $assignToSlot" else "All Applications"
+        alertDialog = AlertDialog.Builder(context)
+            .setTitle(title)
+            .setView(gridView)
             .setNegativeButton("Close", null)
             .create()
 
-        dialog.show()
+        alertDialog.show()
     }
 
-    // Req 8: Swipeable Opened Apps Manager (Swipe any app card left or right to close it)
-    private fun showSwipeableOpenedAppsDialog() {
-        val pm = context.packageManager
+    private fun launchAssignedApp(slotKey: String) {
+        val pkg = prefs.getString("pkg_$slotKey", null)
+        if (pkg != null) {
+            val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
+            if (launchIntent != null) {
+                context.startActivity(launchIntent)
+                return
+            }
+        }
+        showVisualAppDrawer(assignToSlot = slotKey)
+    }
 
-        // Combine apps opened in this session with any active non-system processes
-        try {
-            activityManager.runningAppProcesses?.forEach { proc ->
-                proc.pkgList?.forEach { pkg ->
-                    if (pkg != context.packageName && pm.getLaunchIntentForPackage(pkg) != null) {
-                        openedPackages.add(pkg)
-                    }
+    private fun showTemperatureDialog() {
+        val input = EditText(context).apply {
+            setText(temperatureF.toString())
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+            setSelection(text.length)
+            setPadding(45, 35, 45, 35)
+        }
+        AlertDialog.Builder(context)
+            .setTitle("Set Temperature Readout (°F)")
+            .setView(input)
+            .setPositiveButton("Update") { _, _ ->
+                val v = input.text.toString().toIntOrNull()
+                if (v != null) {
+                    temperatureF = v
+                    prefs.edit().putInt("temp_f", v).apply()
+                    invalidate()
                 }
             }
-        } catch (_: Exception) {}
-
-        // Also include mapped shortcut apps if the list is currently empty
-        if (openedPackages.isEmpty()) {
-            for (k in wingKeys) {
-                prefs.getString("pkg_$k", null)?.let { openedPackages.add(it) }
-            }
-        }
-
-        val scrollView = ScrollView(context).apply {
-            setBackgroundColor(Color.parseColor("#181B22"))
-        }
-        val listContainer = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(28, 20, 28, 20)
-        }
-        scrollView.addView(listContainer)
-
-        val instruction = TextView(context).apply {
-            text = "Swipe any app left or right to close it • Tap an app to switch to it"
-            setTextColor(Color.parseColor("#A0AAB8"))
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setPadding(8, 4, 8, 20)
-        }
-        listContainer.addView(instruction)
-
-        var dialog: AlertDialog? = null
-
-        if (openedPackages.isEmpty()) {
-            val emptyView = TextView(context).apply {
-                text = "No opened background apps"
-                setTextColor(Color.WHITE)
-                textSize = 16f
-                gravity = Gravity.CENTER
-                setPadding(20, 60, 20, 60)
-            }
-            listContainer.addView(emptyView)
-        } else {
-            for (pkg in openedPackages.toList().reversed()) {
-                try {
-                    val appInfo = pm.getApplicationInfo(pkg, 0)
-                    val appLabel = pm.getApplicationLabel(appInfo).toString()
-                    val appIcon = pm.getApplicationIcon(appInfo)
-
-                    val card = LinearLayout(context).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        setBackgroundColor(Color.parseColor("#282D38"))
-                        setPadding(28, 22, 28, 22)
-                        val lp = LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT
-                        )
-                        lp.setMargins(0, 0, 0, 16)
-                        layoutParams = lp
-                    }
-
-                    val img = ImageView(context).apply {
-                        layoutParams = LinearLayout.LayoutParams(72, 72)
-                        setImageDrawable(appIcon)
-                    }
-
-                    val title = TextView(context).apply {
-                        text = appLabel
-                        setTextColor(Color.WHITE)
-                        textSize = 17f
-                        setPadding(28, 0, 20, 0)
-                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                    }
-
-                    val hint = TextView(context).apply {
-                        text = "⟨ Swipe ⟩"
-                        setTextColor(secondaryColor)
-                        textSize = 13f
-                    }
-
-                    card.addView(img)
-                    card.addView(title)
-                    card.addView(hint)
-
-                    // Swipe Left or Right Touch Listener
-                    var startX = 0f
-                    var swiping = false
-                    card.setOnTouchListener { v, ev ->
-                        when (ev.actionMasked) {
-                            MotionEvent.ACTION_DOWN -> {
-                                startX = ev.rawX
-                                swiping = false
-                                true
-                            }
-                            MotionEvent.ACTION_MOVE -> {
-                                val deltaX = ev.rawX - startX
-                                if (abs(deltaX) > 20f) {
-                                    swiping = true
-                                    v.parent?.requestDisallowInterceptTouchEvent(true)
-                                    v.translationX = deltaX
-                                    v.alpha = (1f - (abs(deltaX) / (v.width * 0.75f))).coerceIn(0.15f, 1f)
-                                }
-                                true
-                            }
-                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                                val deltaX = ev.rawX - startX
-                                if (abs(deltaX) > v.width * 0.25f) {
-                                    val exitX = if (deltaX > 0) v.width.toFloat() else -v.width.toFloat()
-                                    v.animate()
-                                        .translationX(exitX)
-                                        .alpha(0f)
-                                        .setDuration(180)
-                                        .withEndAction {
-                                            listContainer.removeView(v)
-                                            openedPackages.remove(pkg)
-                                            try {
-                                                activityManager.killBackgroundProcesses(pkg)
-                                            } catch (_: Exception) {}
-                                            Toast.makeText(context, "Closed $appLabel", Toast.LENGTH_SHORT).show()
-                                        }
-                                        .start()
-                                } else {
-                                    v.animate().translationX(0f).alpha(1f).setDuration(150).start()
-                                    if (!swiping && ev.actionMasked == MotionEvent.ACTION_UP) {
-                                        pm.getLaunchIntentForPackage(pkg)?.let {
-                                            dialog?.dismiss()
-                                            context.startActivity(it)
-                                        }
-                                    }
-                                }
-                                true
-                            }
-                            else -> false
-                        }
-                    }
-
-                    listContainer.addView(card)
-                } catch (_: Exception) {}
-            }
-        }
-
-        dialog = AlertDialog.Builder(context)
-            .setTitle("Opened Apps")
-            .setView(scrollView)
-            .setNeutralButton("System Recents") { _, _ ->
-                try {
-                    val intent = Intent("com.android.systemui.recents.TOGGLE_RECENTS")
-                    intent.setClassName("com.android.systemui", "com.android.systemui.recents.RecentsActivity")
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                } catch (_: Exception) {
-                    Toast.makeText(context, "Use swipe cards to close apps on this unit", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .setNegativeButton("Close", null)
-            .create()
-
-        dialog.show()
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showSkinCustomizerDialog() {
@@ -1282,8 +1249,8 @@ class AgamaDashboardView(
                 primaryColor = pri
                 secondaryColor = sec
                 prefs.edit()
-                    .putInt("primary_color_v2", pri)
-                    .putInt("secondary_color_v2", sec)
+                    .putInt("primary_color_v3", pri)
+                    .putInt("secondary_color_v3", sec)
                     .apply()
                 invalidate()
             }
@@ -1298,7 +1265,7 @@ class AgamaDashboardView(
             "Reset All Custom Labels, Icons & Shortcuts"
         )
         AlertDialog.Builder(context)
-            .setTitle("Vinsanity Launcher Options")
+            .setTitle("System & Launcher Options")
             .setItems(options) { _, which ->
                 when (which) {
                     0 -> LauncherUtils.openHomeSettings(context)
@@ -1312,7 +1279,7 @@ class AgamaDashboardView(
                                 .apply()
                         }
                         invalidate()
-                        Toast.makeText(context, "All customizations reset to default", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "All customizations reset", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
