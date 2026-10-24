@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.CarLauncher.Fullscreen" parent="Theme.MaterialComponents.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:statusBarColor">@color/colorBackground</item>
+        <item name="android:navigationBarColor">@color/colorBarBackground</item>
+    </style>
+</resources>
