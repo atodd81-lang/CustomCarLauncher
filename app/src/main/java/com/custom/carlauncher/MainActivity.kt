@@ -8,12 +8,16 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.graphics.*
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
@@ -34,24 +38,75 @@ class MainActivity : AppCompatActivity() {
     private lateinit var locationManager: LocationManager
     private lateinit var dashboardView: AgamaDashboardView
 
-    // Captures track metadata from standard Android & car music players without needing Notification Access
-    private val mediaMetadataReceiver = object : BroadcastReceiver() {
+    // Captures both Music Player metadata and XYAuto / Android FM Radio station broadcasts
+    private val mediaAndRadioReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent == null) return
+            val action = intent.action.orEmpty()
+
+            // 1. Check if broadcast is from the Head Unit's FM/AM Radio
+            if (action.contains("radio", ignoreCase = true) ||
+                action.contains("fm", ignoreCase = true) ||
+                intent.hasExtra("freq") ||
+                intent.hasExtra("frequency") ||
+                intent.hasExtra("radio_freq")
+            ) {
+                val stationName = intent.getStringExtra("ps")
+                    ?: intent.getStringExtra("rds")
+                    ?: intent.getStringExtra("rt")
+                    ?: intent.getStringExtra("station")
+                    ?: intent.getStringExtra("radio_name")
+                    ?: intent.getStringExtra("name")
+                    ?: intent.getStringExtra("title")
+
+                val rawFreq = intent.extras?.get("freq")?.toString()
+                    ?: intent.extras?.get("frequency")?.toString()
+                    ?: intent.extras?.get("radio_freq")?.toString()
+                    ?: intent.extras?.get("channel")?.toString()
+
+                val band = intent.getStringExtra("band") ?: "FM"
+                val formattedFreq = formatRadioFrequency(rawFreq, band)
+
+                val combinedRadioText = when {
+                    !stationName.isNullOrBlank() && formattedFreq.isNotEmpty() -> "$formattedFreq — $stationName"
+                    !stationName.isNullOrBlank() -> stationName
+                    formattedFreq.isNotEmpty() -> formattedFreq
+                    else -> "FM/AM Radio Active"
+                }
+
+                val isRadioPlaying = intent.getBooleanExtra("playing", true) &&
+                        !action.contains("stop", ignoreCase = true) &&
+                        !action.contains("close", ignoreCase = true)
+
+                dashboardView.updateRadioInfo(combinedRadioText, isRadioPlaying)
+                return
+            }
+
+            // 2. Otherwise process as Music / Media Stream Metadata
             val track = intent.getStringExtra("track")
                 ?: intent.getStringExtra("title")
                 ?: intent.getStringExtra("music_title")
             val artist = intent.getStringExtra("artist")
                 ?: intent.getStringExtra("author")
                 ?: intent.getStringExtra("music_artist")
-            val playing = if (intent.hasExtra("playing")) {
-                intent.getBooleanExtra("playing", true)
-            } else if (intent.hasExtra("playstate")) {
-                intent.getBooleanExtra("playstate", true)
-            } else {
-                true
+            val playing = when {
+                intent.hasExtra("playing") -> intent.getBooleanExtra("playing", true)
+                intent.hasExtra("playstate") -> intent.getBooleanExtra("playstate", true)
+                else -> true
             }
             dashboardView.updateMediaInfo(artist, track, playing)
+        }
+    }
+
+    private fun formatRadioFrequency(raw: String?, band: String): String {
+        if (raw.isNullOrBlank()) return ""
+        val num = raw.toDoubleOrNull() ?: return raw
+        return when {
+            num in 8700.0..10850.0 -> String.format(Locale.US, "%s %.1f MHz", band, num / 100.0)
+            num in 87000.0..108500.0 -> String.format(Locale.US, "%s %.1f MHz", band, num / 1000.0)
+            num in 87.0..108.5 -> String.format(Locale.US, "%s %.1f MHz", band, num)
+            num in 500.0..1750.0 -> String.format(Locale.US, "AM %.0f kHz", num)
+            else -> "$band $raw"
         }
     }
 
@@ -64,11 +119,11 @@ class MainActivity : AppCompatActivity() {
         dashboardView = AgamaDashboardView(this, mediaHelper)
         setContentView(dashboardView)
 
-        registerMediaBroadcasts()
+        registerMediaAndRadioBroadcasts()
         startGpsUpdates()
     }
 
-    private fun registerMediaBroadcasts() {
+    private fun registerMediaAndRadioBroadcasts() {
         val filter = IntentFilter().apply {
             addAction("com.android.music.metachanged")
             addAction("com.android.music.playstatechanged")
@@ -84,18 +139,28 @@ class MainActivity : AppCompatActivity() {
             addAction("com.andrew.apollo.metachanged")
             addAction("com.microntek.music.toast")
             addAction("com.xyauto.music.metachanged")
+
+            addAction("com.xyauto.broadcast.RADIO_INFO")
+            addAction("com.xyauto.radio.metachanged")
+            addAction("com.xyauto.broadcast.radio")
+            addAction("com.microntek.radio.report")
+            addAction("com.android.fmradio.metachanged")
+            addAction("com.fyt.radio")
+            addAction("com.hcn.radio.info")
+            addAction("com.glsx.boot.AC_RADIO_INFO")
+            addAction("cn.abel.action.broadcast")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(mediaMetadataReceiver, filter, Context.RECEIVER_EXPORTED)
+            registerReceiver(mediaAndRadioReceiver, filter, Context.RECEIVER_EXPORTED)
         } else {
-            registerReceiver(mediaMetadataReceiver, filter)
+            registerReceiver(mediaAndRadioReceiver, filter)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try {
-            unregisterReceiver(mediaMetadataReceiver)
+            unregisterReceiver(mediaAndRadioReceiver)
         } catch (_: Exception) {}
     }
 
@@ -115,9 +180,7 @@ class MainActivity : AppCompatActivity() {
                     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
                 }
             )
-        } catch (_: SecurityException) {
-            // Standard fallback if GPS permission is not yet toggled
-        }
+        } catch (_: SecurityException) {}
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -152,30 +215,28 @@ class AgamaDashboardView(
     private val audioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    // Colors: True Crimson Red (#E6192E), Blue (#4A90E2)
-    // #2: Inner icon ring 35% lighter gray (#5E6578)
-    // #4: Outer word wing 5% lighter gray (#2D323E)
     private var primaryColor = prefs.getInt("primary_color_v3", Color.parseColor("#E6192E"))
     private var secondaryColor = prefs.getInt("secondary_color_v3", Color.parseColor("#4A90E2"))
-    private val bgDark = Color.parseColor("#111318")
-    private val podColor = Color.parseColor("#2D323E")
-    private val podPressedColor = Color.parseColor("#3E4556")
+    private val bgDark = Color.parseColor("#0D0F14")
+    private val sharedDarkGray = Color.parseColor("#1E222A")
+    private val podColor = sharedDarkGray
+    private val podPressedColor = Color.parseColor("#2F3542")
     private val innerRingColor = Color.parseColor("#5E6578")
-    private val hubBgColor = Color.parseColor("#16181F")
+    private val hubBgColor = Color.parseColor("#08090C")
 
-    // State Variables
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
     private var temperatureF = prefs.getInt("temp_f", 59)
     private var isPlayingState = false
+    private var isRadioMode = false
     private var currentSongInfo: String = ""
+    private var currentRadioInfo: String = prefs.getString("last_radio_station", "FM Radio") ?: "FM Radio"
     private var scrollXOffset = 0f
     private var pressedZone: String? = null
 
     private val wingKeys = listOf("RADIO", "CARPLAY", "MUSIC", "PHONE", "INTERNET", "APPS")
 
-    // Standard Selectable Icons (#3)
     private val iconTypeNames = arrayOf(
         "Radio Receiver",
         "CarPlay / Media Screen",
@@ -191,16 +252,31 @@ class AgamaDashboardView(
         "Folder / USB"
     )
 
-    // Paints
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+    private val basketballDimplePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        shader = createBasketballDimpleShader()
+    }
+
+    private val solidInnerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 10f
+        color = sharedDarkGray
+    }
+    private val solidInnerRingEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f
+        color = Color.parseColor("#353B48")
+    }
+
     private val groovePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 9f
-        color = Color.parseColor("#111318")
+        color = Color.parseColor("#0D0F14")
         strokeCap = Paint.Cap.BUTT
     }
 
-    // #8: Slightly thicker stitching-style dotted lines
     private val stitchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 3.8f
@@ -215,7 +291,6 @@ class AgamaDashboardView(
         style = Paint.Style.FILL
     }
 
-    // #12: Slightly thinner white border on text and icons
     private val textWhiteOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
@@ -244,11 +319,35 @@ class AgamaDashboardView(
         color = Color.WHITE
     }
 
-    // Animation ticker for scrolling song info and clock updates
+    private fun createBasketballDimpleShader(): BitmapShader {
+        val size = 18
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+
+        c.drawColor(hubBgColor)
+
+        val rimHighlight = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#181B22")
+        }
+        val dimplePit = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#030405")
+        }
+
+        val coords = arrayOf(4.5f to 4.5f, 13.5f to 13.5f)
+        for ((dx, dy) in coords) {
+            c.drawCircle(dx + 0.8f, dy + 0.8f, 3.3f, rimHighlight)
+            c.drawCircle(dx, dy, 3.1f, dimplePit)
+        }
+
+        return BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+    }
+
     private val tickerRunnable = object : Runnable {
         override fun run() {
-            val activeAudio = audioManager.isMusicActive || isPlayingState
-            if (activeAudio) {
+            val activeStream = audioManager.isMusicActive || isPlayingState || isRadioMode
+            if (activeStream) {
                 scrollXOffset += 3.2f
                 invalidate()
                 postDelayed(this, 40L)
@@ -277,6 +376,7 @@ class AgamaDashboardView(
 
     fun updateMediaInfo(artist: String?, track: String?, playing: Boolean) {
         isPlayingState = playing
+        if (playing) isRadioMode = false
         val cleanTrack = track?.trim().orEmpty()
         val cleanArtist = artist?.trim().orEmpty()
         if (cleanTrack.isNotEmpty() || cleanArtist.isNotEmpty()) {
@@ -285,6 +385,16 @@ class AgamaDashboardView(
             } else {
                 cleanTrack.ifEmpty { cleanArtist }
             }
+        }
+        invalidate()
+    }
+
+    fun updateRadioInfo(stationText: String, playing: Boolean) {
+        isRadioMode = playing
+        isPlayingState = playing
+        if (stationText.isNotBlank()) {
+            currentRadioInfo = stationText.trim()
+            prefs.edit().putString("last_radio_station", currentRadioInfo).apply()
         }
         invalidate()
     }
@@ -302,13 +412,11 @@ class AgamaDashboardView(
         canvas.drawText(text, x, y, textPaint)
     }
 
-    // Exact horizontal distance from center (cx) to the inner dotted circle at height y
     private fun getDxInner(y: Float, cy: Float, rInner: Float): Float {
         val dy = abs(y - cy)
         return if (dy < rInner) sqrt(rInner * rInner - dy * dy) else 0f
     }
 
-    // Exact horizontal distance from center (cx) to the outer curved dotted boundary at height y
     private fun getDxOuter(y: Float, cy: Float, rxOuter: Float, ryOuter: Float): Float {
         val dy = y - cy
         val ratio = (dy * dy) / (ryOuter * ryOuter)
@@ -354,12 +462,11 @@ class AgamaDashboardView(
         val y4 = h * 0.81f
         val rowCenters = floatArrayOf(h * 0.095f, h * 0.29f, h * 0.50f, h * 0.71f, h * 0.905f)
 
-        // Highlight pressed outer wing button
         pressedZone?.let { zone ->
-            if (zone.startsWith("WING_") || zone in listOf("RECENTS_TOP_LEFT", "TEMP_TOP_RIGHT", "VOICE", "GEAR_SKIN", "GEAR_HOME")) {
+            if (zone.startsWith("WING_") || zone in listOf("CLOCK_TOP_LEFT", "TEMP_TOP_RIGHT", "WIFI_BOTTOM_LEFT", "GEAR_SKIN", "GEAR_HOME")) {
                 fillPaint.color = podPressedColor
                 val rowIdx = when (zone) {
-                    "RECENTS_TOP_LEFT", "TEMP_TOP_RIGHT" -> 0
+                    "CLOCK_TOP_LEFT", "TEMP_TOP_RIGHT" -> 0
                     "WING_RADIO", "WING_PHONE" -> 1
                     "WING_CARPLAY", "WING_INTERNET" -> 2
                     "WING_MUSIC", "WING_APPS" -> 3
@@ -367,7 +474,7 @@ class AgamaDashboardView(
                 }
                 val topY = when (rowIdx) { 0 -> 0f; 1 -> y1; 2 -> y2; 3 -> y3; else -> y4 }
                 val botY = when (rowIdx) { 0 -> y1; 1 -> y2; 2 -> y3; 3 -> y4; else -> h }
-                val isLeft = zone in listOf("RECENTS_TOP_LEFT", "WING_RADIO", "WING_CARPLAY", "WING_MUSIC", "VOICE")
+                val isLeft = zone in listOf("CLOCK_TOP_LEFT", "WING_RADIO", "WING_CARPLAY", "WING_MUSIC", "WIFI_BOTTOM_LEFT")
                 canvas.save()
                 canvas.clipRect(if (isLeft) 0f else cx, topY, if (isLeft) cx else w, botY)
                 canvas.drawOval(wingRect, fillPaint)
@@ -375,22 +482,18 @@ class AgamaDashboardView(
             }
         }
 
-        // #1: Horizontal lines strictly start at outside of inside dotted curve and end at outside dotted curve
         val rInnerStitch = rInner + 4f
         for (y in floatArrayOf(y1, y2, y3, y4)) {
             val dxIn = getDxInner(y, cy, rInnerStitch)
             val dxOut = getDxOuter(y, cy, rxOuter, ryOuter)
             if (dxOut > dxIn) {
-                // Left horizontal stitch line
                 canvas.drawLine(cx - dxOut, y, cx - dxIn, y, groovePaint)
                 canvas.drawLine(cx - dxOut + 3f, y, cx - dxIn - 3f, y, stitchPaint)
-                // Right horizontal stitch line
                 canvas.drawLine(cx + dxIn, y, cx + dxOut, y, groovePaint)
                 canvas.drawLine(cx + dxIn + 3f, y, cx + dxOut - 3f, y, stitchPaint)
             }
         }
 
-        // Outer Left & Right Curved Stitching Borders (exact match to getDxOuter)
         val leftOuterPath = Path()
         val rightOuterPath = Path()
         val steps = 60
@@ -410,7 +513,6 @@ class AgamaDashboardView(
         canvas.drawPath(rightOuterPath, groovePaint)
         canvas.drawPath(rightOuterPath, stitchPaint)
 
-        // Wing Text Labels (Centered between inner and outer dotted lines at each row's height)
         val labelSize = h * 0.038f
         val leftSlots = arrayOf("RADIO" to rowCenters[1], "CARPLAY" to rowCenters[2], "MUSIC" to rowCenters[3])
         for ((key, ry) in leftSlots) {
@@ -426,38 +528,27 @@ class AgamaDashboardView(
             drawRedOutlinedText(canvas, label, midX, ry + labelSize * 0.35f, labelSize)
         }
 
-        // #7: Four Corner Blue Icons placed strictly between the inner and outer dotted lines
         val topCornerMidOffset = (getDxInner(rowCenters[0], cy, rInnerStitch) + getDxOuter(rowCenters[0], cy, rxOuter, ryOuter)) / 2f
         val botCornerMidOffset = (getDxInner(rowCenters[4], cy, rInnerStitch) + getDxOuter(rowCenters[4], cy, rxOuter, ryOuter)) / 2f
 
-        // #9: Top-Left Two-Screen Recent Apps Icon
-        drawTwoScreensIcon(canvas, cx - topCornerMidOffset, rowCenters[0], h * 0.030f)
-
-        // #10 & #11: Top-Right Compass Heading + Thermometer Icon + Clean Temperature
+        drawTopLeftClock(canvas, cx - topCornerMidOffset, rowCenters[0], h)
         drawTopRightCompassAndTemp(canvas, cx + topCornerMidOffset, rowCenters[0], h)
+        drawWifiSignalIcon(canvas, cx - botCornerMidOffset, rowCenters[4], h * 0.035f)
 
-        // Bottom-Left Voice Microphone Icon
-        drawVoiceIcon(canvas, cx - botCornerMidOffset, rowCenters[4], h * 0.032f)
-
-        // Bottom-Right Dual Settings Gears
         val gearSpacing = h * 0.045f
         drawGearIcon(canvas, cx + botCornerMidOffset - gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
         drawGearIcon(canvas, cx + botCornerMidOffset + gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
     }
 
     private fun drawInnerRing(canvas: Canvas, cx: Float, cy: Float, h: Float, rHub: Float, rInner: Float) {
-        // Dark separator groove around inner ring
         groovePaint.strokeWidth = 12f
         canvas.drawCircle(cx, cy, rInner, groovePaint)
 
-        // #2: 35% Lighter Gray Inner Ring Fill
         fillPaint.color = innerRingColor
         canvas.drawCircle(cx, cy, rInner - 4f, fillPaint)
 
-        // Stitching circle around inner ring
         canvas.drawCircle(cx, cy, rInner + 4f, stitchPaint)
 
-        // Diagonal radial dividers separating Top Arc, Bottom Arc, Left Icons, Right Icons
         groovePaint.strokeWidth = 10f
         val angles = floatArrayOf(42f, 138f, 222f, 318f)
         for (deg in angles) {
@@ -470,7 +561,6 @@ class AgamaDashboardView(
             canvas.drawLine(xStart, yStart, xEnd, yEnd, stitchPaint)
         }
 
-        // Horizontal stitch dividers inside the Left & Right inner icon rings
         for (y in floatArrayOf(h * 0.39f, h * 0.61f)) {
             val dy = abs(y - cy)
             if (dy < rInner) {
@@ -485,7 +575,6 @@ class AgamaDashboardView(
 
         val rMid = (rHub + rInner) / 2f
 
-        // TOP ARC: Date, Day of Week, and Volume - / +
         val dateFormat = SimpleDateFormat("MMMM d, yyyy", Locale.US)
         val dayFormat = SimpleDateFormat("EEEE", Locale.US)
         val now = Date()
@@ -501,18 +590,16 @@ class AgamaDashboardView(
         drawRedOutlinedText(canvas, "-", cx + rMid * cos(volAngleLeft).toFloat(), cy + rMid * sin(volAngleLeft).toFloat() + 14f, h * 0.054f)
         drawRedOutlinedText(canvas, "+", cx + rMid * cos(volAngleRight).toFloat(), cy + rMid * sin(volAngleRight).toFloat() + 14f, h * 0.054f)
 
-        // BOTTOM ARC: < (Prev), Music Player / Scrolling Song Info, > (Next)
-        drawRedOutlinedText(canvas, "Music Player", cx, cy + rMid - h * 0.006f, h * 0.031f)
+        val bottomHeader = if (isRadioMode) "RadioTuner" else "Music Player"
+        drawRedOutlinedText(canvas, bottomHeader, cx, cy + rMid - h * 0.006f, h * 0.031f)
 
-        // Scrolling Song Title / Artist Ticker when playing
-        drawBottomMediaSubtext(canvas, cx, cy + rMid + h * 0.036f, rHub * 0.62f, h * 0.028f)
+        drawBottomMediaAndRadioSubtext(canvas, cx, cy + rMid + h * 0.036f, rHub * 0.62f, h * 0.028f)
 
         val mediaAngleLeft = Math.toRadians(118.0)
         val mediaAngleRight = Math.toRadians(62.0)
         drawRedOutlinedText(canvas, "<", cx + rMid * cos(mediaAngleLeft).toFloat(), cy + rMid * sin(mediaAngleLeft).toFloat() + 12f, h * 0.050f)
         drawRedOutlinedText(canvas, ">", cx + rMid * cos(mediaAngleRight).toFloat(), cy + rMid * sin(mediaAngleRight).toFloat() + 12f, h * 0.050f)
 
-        // LEFT & RIGHT INNER RING ICONS (Customizable via Long-Press #3)
         val iconSize = h * 0.031f
         drawCustomSlotIcon(canvas, "RADIO", 0, cx - rMid * 0.92f, h * 0.29f, iconSize)
         drawCustomSlotIcon(canvas, "CARPLAY", 1, cx - rMid, h * 0.50f, iconSize)
@@ -523,22 +610,24 @@ class AgamaDashboardView(
         drawCustomSlotIcon(canvas, "APPS", 5, cx + rMid * 0.92f, h * 0.71f, iconSize)
     }
 
-    private fun drawBottomMediaSubtext(canvas: Canvas, cx: Float, y: Float, halfWidth: Float, textSize: Float) {
+    private fun drawBottomMediaAndRadioSubtext(canvas: Canvas, cx: Float, y: Float, halfWidth: Float, textSize: Float) {
         textPaint.textSize = textSize
         textPaint.color = secondaryColor
 
-        val active = audioManager.isMusicActive || isPlayingState
+        val active = audioManager.isMusicActive || isPlayingState || isRadioMode
         if (!active) {
             canvas.drawText("Play", cx, y, textPaint)
             return
         }
 
-        val tickerText = if (currentSongInfo.isNotEmpty()) {
-            "$currentSongInfo     •     "
-        } else {
-            "Playing Audio Stream     •     "
+        val rawInfo = when {
+            isRadioMode && currentRadioInfo.isNotEmpty() -> currentRadioInfo
+            currentSongInfo.isNotEmpty() -> currentSongInfo
+            isRadioMode -> "FM/AM Radio Station Active"
+            else -> "Playing Audio Stream"
         }
 
+        val tickerText = "$rawInfo     •     "
         val textWidth = textPaint.measureText(tickerText)
         if (textWidth <= 0f) {
             canvas.drawText("Playing", cx, y, textPaint)
@@ -575,13 +664,24 @@ class AgamaDashboardView(
     }
 
     private fun drawCentralHub(canvas: Canvas, cx: Float, cy: Float, rHub: Float) {
-        fillPaint.color = Color.parseColor("#0B0C0E")
-        canvas.drawCircle(cx, cy, rHub + 6f, fillPaint)
+        fillPaint.color = Color.parseColor("#040507")
+        canvas.drawCircle(cx, cy, rHub + 7f, fillPaint)
 
-        fillPaint.color = hubBgColor
+        canvas.drawCircle(cx, cy, rHub, basketballDimplePaint)
+
+        val vignette = RadialGradient(
+            cx, cy, rHub,
+            intArrayOf(Color.TRANSPARENT, Color.TRANSPARENT, Color.argb(140, 0, 0, 0)),
+            floatArrayOf(0f, 0.72f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        fillPaint.shader = vignette
         canvas.drawCircle(cx, cy, rHub, fillPaint)
+        fillPaint.shader = null
 
-        canvas.drawCircle(cx, cy, rHub + 2f, stitchPaint)
+        canvas.drawCircle(cx, cy, rHub + 2f, solidInnerRingPaint)
+        canvas.drawCircle(cx, cy, rHub - 3f, solidInnerRingEdgePaint)
+        canvas.drawCircle(cx, cy, rHub + 7f, solidInnerRingEdgePaint)
 
         when (centerMode) {
             0 -> drawGlossySubaruBadge(canvas, cx, cy, rHub * 0.80f, rHub * 0.44f)
@@ -663,7 +763,7 @@ class AgamaDashboardView(
         canvas.drawPath(path, fillPaint)
     }
 
-    // --- Vector Icon Helpers (With Thinner White Outlines #12) ---
+    // --- Vector Icon Helpers ---
     private fun drawRadioIcon(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
         val rect = RectF(cx - s, cy - s * 0.6f, cx + s, cy + s * 0.8f)
         for (p in arrayOf(iconWhiteOutlinePaint, iconPaint.apply { this.color = color })) {
@@ -796,26 +896,14 @@ class AgamaDashboardView(
         }
     }
 
-    // #9: Two-Screen Overlapping Rectangles Icon (Recent Apps)
-    private fun drawTwoScreensIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
-        iconPaint.color = secondaryColor
-        // Front screen rectangle
-        val front = RectF(cx - s * 0.95f, cy - s * 0.45f, cx + s * 0.45f, cy + s * 0.75f)
-        canvas.drawRoundRect(front, 6f, 6f, iconPaint)
-        // Rear overlapping screen
-        val backPath = Path().apply {
-            moveTo(cx - s * 0.35f, cy - s * 0.45f)
-            lineTo(cx - s * 0.35f, cy - s * 0.85f)
-            lineTo(cx + s * 0.95f, cy - s * 0.85f)
-            lineTo(cx + s * 0.95f, cy + s * 0.35f)
-            lineTo(cx + s * 0.45f, cy + s * 0.35f)
-        }
-        canvas.drawPath(backPath, iconPaint)
+    private fun drawTopLeftClock(canvas: Canvas, cx: Float, cy: Float, h: Float) {
+        val timeFmt = SimpleDateFormat("h:mm", Locale.US)
+        textPaint.textSize = h * 0.042f
+        textPaint.color = secondaryColor
+        canvas.drawText(timeFmt.format(Date()), cx, cy + h * 0.015f, textPaint)
     }
 
-    // #10 & #11: Compass Direction + Thermometer Icon + Clean Temperature without "+"
     private fun drawTopRightCompassAndTemp(canvas: Canvas, cx: Float, cy: Float, h: Float) {
-        // 1. Compass Badge with N, NE, E, SE, S, SW, W, NW
         val compX = cx - h * 0.088f
         val compRadius = h * 0.032f
         iconPaint.color = secondaryColor
@@ -825,30 +913,55 @@ class AgamaDashboardView(
         textPaint.color = secondaryColor
         canvas.drawText(compassDir, compX, cy + h * 0.009f, textPaint)
 
-        // 2. Vector Thermometer Icon in front of temperature
         val thermX = cx - h * 0.022f
         val rBulb = h * 0.013f
         fillPaint.color = secondaryColor
         canvas.drawCircle(thermX, cy + h * 0.014f, rBulb, fillPaint)
         iconPaint.strokeWidth = 4.2f
         canvas.drawLine(thermX, cy + h * 0.010f, thermX, cy - h * 0.024f, iconPaint)
-        // Thermometer degree tick marks
         canvas.drawLine(thermX + 4f, cy - h * 0.018f, thermX + 10f, cy - h * 0.018f, iconPaint)
         canvas.drawLine(thermX + 4f, cy - h * 0.006f, thermX + 10f, cy - h * 0.006f, iconPaint)
 
-        // 3. Temperature text (no "+" when above freezing)
         textPaint.textSize = h * 0.040f
         textPaint.color = secondaryColor
         val tempStr = "${temperatureF}°"
         canvas.drawText(tempStr, cx + h * 0.052f, cy + h * 0.015f, textPaint)
     }
 
-    private fun drawVoiceIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
-        iconPaint.color = secondaryColor
-        iconPaint.strokeWidth = 4.2f
-        canvas.drawRoundRect(RectF(cx - s * 0.35f, cy - s * 0.8f, cx + s * 0.35f, cy + s * 0.2f), 12f, 12f, iconPaint)
-        canvas.drawArc(RectF(cx - s * 0.7f, cy - s * 0.5f, cx + s * 0.7f, cy + s * 0.55f), 0f, 180f, false, iconPaint)
-        canvas.drawLine(cx, cy + s * 0.55f, cx, cy + s * 0.95f, iconPaint)
+    private fun getWifiSignalLevel(): Int {
+        return try {
+            val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            if (wm != null && wm.isWifiEnabled) {
+                val info = wm.connectionInfo
+                if (info != null && info.networkId != -1) {
+                    WifiManager.calculateSignalLevel(info.rssi, 4)
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } catch (_: Exception) {
+            3
+        }
+    }
+
+    private fun drawWifiSignalIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
+        val level = getWifiSignalLevel()
+        val dimColor = Color.argb(65, Color.red(secondaryColor), Color.green(secondaryColor), Color.blue(secondaryColor))
+        val baseY = cy + s * 0.55f
+
+        fillPaint.color = if (level >= 1) secondaryColor else dimColor
+        canvas.drawCircle(cx, baseY, s * 0.16f, fillPaint)
+
+        iconPaint.strokeWidth = 4.0f
+        val radii = floatArrayOf(s * 0.50f, s * 0.88f, s * 1.26f)
+        for (i in radii.indices) {
+            val r = radii[i]
+            iconPaint.color = if (level > i) secondaryColor else dimColor
+            val arcRect = RectF(cx - r, baseY - r, cx + r, baseY + r)
+            canvas.drawArc(arcRect, 225f, 90f, false, iconPaint)
+        }
     }
 
     private fun drawGearIcon(canvas: Canvas, cx: Float, cy: Float, r: Float, color: Int) {
@@ -867,7 +980,6 @@ class AgamaDashboardView(
         }
     }
 
-    // --- Touch & Long-Press Detection ---
     private var downTime = 0L
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -914,7 +1026,6 @@ class AgamaDashboardView(
 
         if (dist <= rHub) return "CENTER_HUB"
 
-        // Inner Ring: Distinguishes ICON_* touches (#3) from outer WING_* text touches (#5)
         if (dist <= rInner) {
             val angle = (Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())) + 360) % 360
             return when {
@@ -949,15 +1060,14 @@ class AgamaDashboardView(
             }
         }
 
-        // Outer Curved Wings
         val isLeft = x < cx
         return when {
-            y < h * 0.19f -> if (isLeft) "RECENTS_TOP_LEFT" else "TEMP_TOP_RIGHT"
+            y < h * 0.19f -> if (isLeft) "CLOCK_TOP_LEFT" else "TEMP_TOP_RIGHT"
             y < h * 0.39f -> if (isLeft) "WING_RADIO" else "WING_PHONE"
             y < h * 0.61f -> if (isLeft) "WING_CARPLAY" else "WING_INTERNET"
             y < h * 0.81f -> if (isLeft) "WING_MUSIC" else "WING_APPS"
             else -> {
-                if (isLeft) "VOICE"
+                if (isLeft) "WIFI_BOTTOM_LEFT"
                 else {
                     val botCornerMid = cx + (getDxInner(h * 0.905f, cy, rInner + 4f) + getDxOuter(h * 0.905f, cy, w * 0.47f, h * 0.58f)) / 2f
                     if (x < botCornerMid) "GEAR_SKIN" else "GEAR_HOME"
@@ -986,13 +1096,23 @@ class AgamaDashboardView(
             "MEDIA_PREV" -> mediaHelper.prevTrack()
             "MEDIA_NEXT" -> mediaHelper.nextTrack()
             "MEDIA_PLAY" -> {
-                mediaHelper.playPause()
-                togglePlayState()
+                if (isLongPress) {
+                    showRadioStationTextDialog()
+                } else {
+                    mediaHelper.playPause()
+                    togglePlayState()
+                }
             }
-            "RECENTS_TOP_LEFT" -> openRecentApps()
+            "CLOCK_TOP_LEFT" -> openRecentApps()
             "TEMP_TOP_RIGHT" -> showTemperatureDialog()
+            "WIFI_BOTTOM_LEFT" -> {
+                try {
+                    context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                } catch (_: Exception) {
+                    context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            }
 
-            // #3: Long-press on any red inner-ring icon opens the Standard Icon Picker
             "ICON_RADIO", "ICON_CARPLAY", "ICON_MUSIC", "ICON_PHONE", "ICON_INTERNET", "ICON_APPS" -> {
                 val slotKey = zone.removePrefix("ICON_")
                 if (isLongPress) {
@@ -1000,11 +1120,18 @@ class AgamaDashboardView(
                 } else if (slotKey == "APPS") {
                     showVisualAppDrawer(assignToSlot = null)
                 } else {
+                    if (slotKey == "RADIO") {
+                        isRadioMode = true
+                        isPlayingState = true
+                        invalidate()
+                    } else if (slotKey == "MUSIC") {
+                        isRadioMode = false
+                        invalidate()
+                    }
                     launchAssignedApp(slotKey)
                 }
             }
 
-            // #5 & #6: Long-press on any outer red word opens the Keyboard Rename + App Picker Dialog
             "WING_RADIO", "WING_CARPLAY", "WING_MUSIC", "WING_PHONE", "WING_INTERNET", "WING_APPS" -> {
                 val slotKey = zone.removePrefix("WING_")
                 if (isLongPress) {
@@ -1012,31 +1139,52 @@ class AgamaDashboardView(
                 } else if (slotKey == "APPS") {
                     showVisualAppDrawer(assignToSlot = null)
                 } else {
+                    if (slotKey == "RADIO") {
+                        isRadioMode = true
+                        isPlayingState = true
+                        invalidate()
+                    } else if (slotKey == "MUSIC") {
+                        isRadioMode = false
+                        invalidate()
+                    }
                     launchAssignedApp(slotKey)
                 }
             }
 
-            "VOICE" -> {
-                try {
-                    context.startActivity(Intent(Intent.ACTION_VOICE_COMMAND).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                } catch (_: Exception) {
-                    showVisualAppDrawer(assignToSlot = "VOICE")
-                }
-            }
             "GEAR_SKIN" -> showSkinCustomizerDialog()
             "GEAR_HOME" -> showEscapeHatchDialog()
         }
     }
 
-    // #9: Triggers Android's Recent Apps (Multitasking Swipe-to-Close Carousel)
+    private fun showRadioStationTextDialog() {
+        val input = EditText(context).apply {
+            setText(currentRadioInfo)
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSelection(text.length)
+            setPadding(45, 35, 45, 35)
+        }
+        AlertDialog.Builder(context)
+            .setTitle("Radio / Ticker Display")
+            .setMessage("Toggle Radio Ticker mode or set custom station text:")
+            .setView(input)
+            .setPositiveButton("Show Radio Ticker") { _, _ ->
+                val text = input.text.toString().trim().ifEmpty { "FM Radio Active" }
+                updateRadioInfo(text, true)
+            }
+            .setNeutralButton("Switch to Music") { _, _ ->
+                isRadioMode = false
+                invalidate()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun openRecentApps() {
-        // Method 1: SystemUI Recents Toggle Broadcast (Supported on most XYAuto / Android head units)
         try {
             context.sendBroadcast(Intent("com.android.systemui.recents.TOGGLE_RECENTS"))
             context.sendBroadcast(Intent("com.xyauto.broadcast.RECENTS"))
         } catch (_: Exception) {}
 
-        // Method 2: Direct SystemUI RecentsActivity Intent
         val recentsComponents = listOf(
             ComponentName("com.android.systemui", "com.android.systemui.recents.RecentsActivity"),
             ComponentName("com.android.systemui", "com.android.quickstep.RecentsActivity"),
@@ -1053,13 +1201,11 @@ class AgamaDashboardView(
             } catch (_: Exception) {}
         }
 
-        // Method 3: Dispatch Hardware APP_SWITCH Keycode (Keycode 187)
         try {
             Runtime.getRuntime().exec("input keyevent 187")
         } catch (_: Exception) {}
     }
 
-    // #3: Standard Icon Picker for Inner Red Icons
     private fun showIconPickerDialog(slotKey: String) {
         AlertDialog.Builder(context)
             .setTitle("Select Icon for $slotKey")
@@ -1071,7 +1217,6 @@ class AgamaDashboardView(
             .show()
     }
 
-    // #5: Pop-up Keyboard Dialog to Rename Wing Text & Assign App
     private fun showRenameAndAssignDialog(slotKey: String) {
         val currentLabel = prefs.getString("label_$slotKey", slotKey) ?: slotKey
         val input = EditText(context).apply {
@@ -1111,19 +1256,49 @@ class AgamaDashboardView(
         }, 150L)
     }
 
-    // #6: Visual App Drawer Grid with Installed Android Application Icons
+    /**
+     * Renders any Android app Drawable onto a clean square Bitmap with internal margin
+     * so square app icons/widgets never have their left or right sides cut off.
+     */
+    private fun renderUncroppedSquareIcon(drawable: Drawable, boxSizePx: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(boxSizePx, boxSizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val pad = (boxSizePx * 0.08f).toInt()
+        val avail = boxSizePx - pad * 2
+
+        val intrW = drawable.intrinsicWidth.takeIf { it > 0 } ?: avail
+        val intrH = drawable.intrinsicHeight.takeIf { it > 0 } ?: avail
+        val scale = min(avail.toFloat() / intrW.toFloat(), avail.toFloat() / intrH.toFloat())
+
+        val drawW = (intrW * scale).toInt()
+        val drawH = (intrH * scale).toInt()
+        val left = (boxSizePx - drawW) / 2
+        val top = (boxSizePx - drawH) / 2
+
+        drawable.setBounds(left, top, left + drawW, top + drawH)
+        drawable.draw(canvas)
+        return bmp
+    }
+
+    // Full-Width Visual App Drawer with Uncropped Square App Tiles
     private fun showVisualAppDrawer(assignToSlot: String?) {
         val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(mainIntent, 0).sortedBy { it.loadLabel(pm).toString().lowercase() }
 
+        val screenW = width.takeIf { it > 0 } ?: 1024
+        val screenH = height.takeIf { it > 0 } ?: 600
+        val iconBoxSize = (screenH * 0.135f).toInt().coerceIn(72, 110)
+
         val gridView = GridView(context).apply {
             numColumns = 5
-            verticalSpacing = 28
-            horizontalSpacing = 20
-            setPadding(32, 32, 32, 32)
+            verticalSpacing = 24
+            horizontalSpacing = 24
+            setPadding(36, 28, 36, 28)
+            clipToPadding = false
+            clipChildren = false
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
-            setBackgroundColor(Color.parseColor("#181C24"))
+            setBackgroundColor(Color.parseColor("#141820"))
         }
 
         lateinit var alertDialog: AlertDialog
@@ -1134,17 +1309,30 @@ class AgamaDashboardView(
             override fun getItemId(position: Int): Long = position.toLong()
 
             override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                val tileBg = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 18f
+                    setColor(Color.parseColor("#222733"))
+                    setStroke(2, Color.parseColor("#353C4B"))
+                }
+
                 val itemLayout = LinearLayout(context).apply {
                     orientation = LinearLayout.VERTICAL
                     gravity = Gravity.CENTER
-                    setPadding(12, 16, 12, 16)
+                    setPadding(16, 18, 16, 16)
+                    clipChildren = false
+                    clipToPadding = false
+                    background = tileBg
                 }
 
                 val appInfo = apps[position]
+                val uncroppedBmp = renderUncroppedSquareIcon(appInfo.loadIcon(pm), iconBoxSize)
+
                 val iconView = ImageView(context).apply {
-                    layoutParams = LinearLayout.LayoutParams(96, 96)
+                    layoutParams = LinearLayout.LayoutParams(iconBoxSize, iconBoxSize)
                     scaleType = ImageView.ScaleType.FIT_CENTER
-                    setImageDrawable(appInfo.loadIcon(pm))
+                    adjustViewBounds = true
+                    setImageBitmap(uncroppedBmp)
                 }
 
                 val labelView = TextView(context).apply {
@@ -1154,11 +1342,11 @@ class AgamaDashboardView(
                     )
                     text = appInfo.loadLabel(pm).toString()
                     setTextColor(Color.WHITE)
-                    textSize = 12f
+                    textSize = 13f
                     gravity = Gravity.CENTER
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
-                    setPadding(0, 8, 0, 0)
+                    setPadding(4, 10, 4, 0)
                 }
 
                 itemLayout.addView(iconView)
@@ -1190,6 +1378,11 @@ class AgamaDashboardView(
             .create()
 
         alertDialog.show()
+        // Expand dialog to 92% of the landscape head unit width so no columns or square icons are ever cut off
+        alertDialog.window?.setLayout(
+            (screenW * 0.92f).toInt(),
+            (screenH * 0.86f).toInt()
+        )
     }
 
     private fun launchAssignedApp(slotKey: String) {
@@ -1269,7 +1462,7 @@ class AgamaDashboardView(
             .setItems(options) { _, which ->
                 when (which) {
                     0 -> LauncherUtils.openHomeSettings(context)
-                    1 -> context.startActivity(Intent(android.provider.Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    1 -> context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     2 -> {
                         for (k in wingKeys) {
                             prefs.edit()
