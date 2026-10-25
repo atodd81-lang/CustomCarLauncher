@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Dark Obsidian Rounded Square App Icon Background -->
+    <path
+        android:fillColor="#07080C"
+        android:pathData="M18,0 L90,0 C100,0 108,8 108,18 L108,90 C108,100 100,108 90,108 L18,108 C8,108 0,100 0,90 L0,18 C0,8 8,0 18,0 Z" />
+
+    <!-- Outer Metallic Rim -->
+    <path
+        android:strokeColor="#2A303C"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M18,2 L90,2 C98.8,2 106,9.2 106,18 L106,90 C106,98.8 98.8,106 90,106 L18,106 C9.2,106 2,98.8 2,90 L2,18 C2,9.2 9.2,2 18,2 Z" />
+
+    <!-- Outer Fiery Glow of the Eye -->
+    <path
+        android:fillColor="#44E63900"
+        android:pathData="M 6,54 Q 54,10 102,54 Q 54,98 6,54 Z" />
+
+    <!-- Cat's Eye / Eye of Sauron Almond Iris -->
+    <path android:pathData="M 10,54 Q 54,14 98,54 Q 54,94 10,54 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="54"
+                android:centerY="54"
+                android:gradientRadius="44"
+                android:type="radial">
+                <item android:color="#FFF59D" android:offset="0.0" />
+                <item android:color="#FF9800" android:offset="0.45" />
+                <item android:color="#D84315" android:offset="0.80" />
+                <item android:color="#3E0B00" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Radial Iris Fiber Striations -->
+    <path
+        android:strokeColor="#553E0B00"
+        android:strokeWidth="1.2"
+        android:pathData="M 24,42 L 44,50 M 24,66 L 44,58 M 84,42 L 64,50 M 84,66 L 64,58 M 36,32 L 48,46 M 72,32 L 60,46 M 36,76 L 48,62 M 72,76 L 60,62" />
+
+    <!-- Vertical Feline / Sauron Slit Pupil -->
+    <path
+        android:fillColor="#040507"
+        android:strokeColor="#FFB300"
+        android:strokeWidth="1.2"
+        android:pathData="M 54,19 Q 65,54 54,89 Q 43,54 54,19 Z" />
+
+    <!-- ======================== -->
+    <!-- REFLECTION OF SILVER-GREY 2016 SUBARU LEGACY SEDAN ACROSS THE EYE -->
+    <!-- ======================== -->
+
+    <!-- Car Roof & Greenhouse Cabin Silhouette (Silver-Grey) -->
+    <path
+        android:fillColor="#B8C2CC"
+        android:strokeColor="#E2E8F0"
+        android:strokeWidth="0.9"
+        android:pathData="M 35,51 L 41,42 L 67,42 L 73,51 Z" />
+
+    <!-- Windshield Glass Reflection -->
+    <path
+        android:fillColor="#881E293B"
+        android:pathData="M 37,50 L 42,43.5 L 66,43.5 L 71,50 Z" />
+
+    <!-- 2016 Legacy Wide Lower Body & Front Bumper (Ice Silver Metallic) -->
+    <path
+        android:fillColor="#94A3B8"
+        android:strokeColor="#F1F5F9"
+        android:strokeWidth="1.0"
+        android:pathData="M 28,51 L 80,51 L 83,56 L 81,64 L 27,64 L 25,56 Z" />
+
+    <!-- Hood Character Lines -->
+    <path
+        android:strokeColor="#E2E8F0"
+        android:strokeWidth="0.8"
+        android:pathData="M 37,51 L 43,56 M 71,51 L 65,56" />
+
+    <!-- Signature 2016 Subaru Hexagonal Front Grille -->
+    <path
+        android:fillColor="#1E242B"
+        android:strokeColor="#E2E8F0"
+        android:strokeWidth="1.2"
+        android:pathData="M 45,55 L 63,55 L 65,58.5 L 62,62 L 46,62 L 43,58.5 Z" />
+
+    <!-- Chrome Wing Bar & Star Emblem Inside Grille -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.1"
+        android:pathData="M 45,58 L 63,58" />
+    <path
+        android:fillColor="#1D70B8"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="0.7"
+        android:pathData="M 51.5,58 A 2.5,1.6 0 1,0 56.5,58 A 2.5,1.6 0 1,0 51.5,58 Z" />
+
+    <!-- Left & Right C-Shaped Hawk-Eye Headlights -->
+    <path
+        android:fillColor="#E0F2FE"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="0.9"
+        android:pathData="M 29,54 L 39,55 L 38,59 L 28,58 Z" />
+    <path
+        android:fillColor="#E0F2FE"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="0.9"
+        android:pathData="M 79,54 L 69,55 L 70,59 L 80,58 Z" />
+
+    <!-- Lower Fog Light Bezels -->
+    <path
+        android:fillColor="#334155"
+        android:pathData="M 29,60.5 L 35,60.5 L 35,63 L 29,63 Z M 73,60.5 L 79,60.5 L 79,63 L 73,63 Z" />
+
+    <!-- Upper Cornea Glass Specular Highlight -->
+    <path
+        android:fillColor="#38FFFFFF"
+        android:pathData="M 24,36 Q 54,20 84,36 Q 54,28 24,36 Z" />
+
+    <!-- Heavy Eyelid Crease Border -->
+    <path
+        android:strokeColor="#1A1D24"
+        android:strokeWidth="3.5"
+        android:fillColor="#00000000"
+        android:pathData="M 10,54 Q 54,14 98,54 Q 54,94 10,54 Z" />
+</vector>
