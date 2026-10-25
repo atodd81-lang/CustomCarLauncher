@@ -72,7 +72,10 @@ class MainActivity : AppCompatActivity() {
             val bundle = intent.extras
 
             if (!action.contains("BATTERY") && !action.contains("TIME_TICK")) {
-                val keysSummary = bundle?.keySet()?.joinToString(", ") { k -> "$k=${bundle.get(k)}" } ?: "no-extras"
+                val keysSummary = bundle?.keySet()?.joinToString(", ") { k ->
+                    @Suppress("DEPRECATION")
+                    "$k=${bundle.get(k)}"
+                } ?: "no-extras"
                 val entry = "[${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())}] $action ($keysSummary)"
                 recentBroadcastLog.addFirst(entry)
                 while (recentBroadcastLog.size > 18) recentBroadcastLog.removeLast()
@@ -107,7 +110,7 @@ class MainActivity : AppCompatActivity() {
                 (action.contains("stop", ignoreCase = true) ||
                         action.contains("close", ignoreCase = true) ||
                         action.contains("exit", ignoreCase = true) ||
-                        intent.getBooleanExtra("playing", true) == false ||
+                        !intent.getBooleanExtra("playing", true) ||
                         intent.getIntExtra("state", 1) == 0)
             ) {
                 dashboardView.setRadioInactive()
@@ -157,6 +160,7 @@ class MainActivity : AppCompatActivity() {
 
                 if (parts.isEmpty() && bundle != null) {
                     for (key in bundle.keySet()) {
+                        @Suppress("DEPRECATION")
                         val v = bundle.get(key)?.toString()?.trim().orEmpty()
                         if (v.isNotEmpty() && v != "true" && v != "false") {
                             val maybeFreq = formatRadioFrequency(v, band)
@@ -191,6 +195,7 @@ class MainActivity : AppCompatActivity() {
                 action.contains("pause", ignoreCase = true) -> false
                 bundle?.containsKey("playing") == true -> bundle.getBoolean("playing", true)
                 bundle?.containsKey("playstate") == true -> {
+                    @Suppress("DEPRECATION")
                     val st = bundle.get("playstate")
                     when (st) {
                         is Boolean -> st
@@ -223,6 +228,7 @@ class MainActivity : AppCompatActivity() {
         for (k in keys) {
             for (actualKey in bundle.keySet()) {
                 if (actualKey.equals(k, ignoreCase = true)) {
+                    @Suppress("DEPRECATION")
                     val v = bundle.get(actualKey)?.toString()?.trim().orEmpty()
                     if (v.isNotEmpty() && v != "null") return v
                 }
@@ -540,6 +546,7 @@ class MainActivity : AppCompatActivity() {
                 if (v == 1 || v == 2) return true
             }
 
+            @Suppress("DEPRECATION")
             val adapter = BluetoothAdapter.getDefaultAdapter()
             if (adapter != null && adapter.isEnabled) {
                 val a2dp = adapter.getProfileConnectionState(BluetoothProfile.A2DP)
@@ -605,7 +612,9 @@ class MainActivity : AppCompatActivity() {
         if (!savedPkg.isNullOrBlank() && !savedPkg.contains("com.android.settings")) {
             if (!savedCls.isNullOrBlank() && !savedCls.contains("setting", ignoreCase = true)) {
                 try {
-                    val compIntent = Intent.makeMainActivity(ComponentName(savedPkg, savedCls)).apply {
+                    val compIntent = Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                        component = ComponentName(savedPkg, savedCls)
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
                     }
                     startActivity(compIntent)
@@ -616,6 +625,7 @@ class MainActivity : AppCompatActivity() {
 
         // 3. Scan all installed activities on the head unit for the true CarPlay / Zlink / Tlink projection screen
         val mainIntent = Intent(Intent.ACTION_MAIN, null)
+        @Suppress("DEPRECATION")
         val allActivities = pm.queryIntentActivities(mainIntent, 0)
 
         val carPlayKeywords = listOf(
@@ -630,16 +640,16 @@ class MainActivity : AppCompatActivity() {
                 val cls = actInfo.name.lowercase()
                 val label = resolveInfo.loadLabel(pm).toString().lowercase()
 
-                // Never launch Android Settings or a Settings sub-activity
                 if (pkg == "com.android.settings" || cls.contains("setting")) continue
 
                 if (pkg.contains(keyword) || cls.contains(keyword) || label.contains(keyword)) {
                     try {
                         val comp = ComponentName(actInfo.packageName, actInfo.name)
-                        val launch = Intent.makeMainActivity(comp).apply {
+                        val launch = Intent(Intent.ACTION_MAIN).apply {
+                            addCategory(Intent.CATEGORY_LAUNCHER)
+                            component = comp
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
                         }
-                        // Save the discovered projection component for instant future launches
                         prefs.edit()
                             .putString("pkg_CARPLAY", actInfo.packageName)
                             .putString("cls_CARPLAY", actInfo.name)
@@ -651,7 +661,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 4. Fallback: Try Apple Maps / Google Maps if no CarPlay bridge activity matched
+        // 4. Fallback: Try Google Maps if no CarPlay bridge activity matched
         val mapsIntent = pm.getLaunchIntentForPackage("com.google.android.apps.maps")
         if (mapsIntent != null) {
             mapsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -743,9 +753,9 @@ class MainActivity : AppCompatActivity() {
 }
 
 class AgamaDashboardView(
-    private val mainActivity: MainActivity,
+    private val hostActivity: MainActivity,
     private val mediaHelper: MediaControlHelper
-) : View(mainActivity) {
+) : View(hostActivity) {
 
     private val prefs: SharedPreferences =
         context.getSharedPreferences("agama_subaru_prefs", Context.MODE_PRIVATE)
@@ -764,11 +774,6 @@ class AgamaDashboardView(
     private var innerRingColor = prefs.getInt("inner_ring_color_v3", defaultInnerRingGray)
     private var wingBaseColor = prefs.getInt("wing_base_color_v3", defaultWingBaseGray)
 
-    // Center Hub Mode:
-    // 0 = Glossy Subaru Emblem (Default)
-    // 1 = Live GPS Speedometer (MPH)
-    // 2 = Digital Clock + Speed + Compass
-    // 3 = Apple CarPlay Navigation Hub
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
     private var currentBearingDeg = 0f
@@ -916,7 +921,7 @@ class AgamaDashboardView(
 
             pollCounter++
             if (isRadioActive && pollCounter % 45 == 0) {
-                val polledFreq = mainActivity.pollSystemRadioFrequency()
+                val polledFreq = hostActivity.pollSystemRadioFrequency()
                 if (polledFreq.isNotEmpty()) {
                     currentRadioText = polledFreq
                     prefs.edit().putString("last_radio_text", currentRadioText).apply()
@@ -948,7 +953,7 @@ class AgamaDashboardView(
         if (audioManager.isMusicActive) {
             isMediaBroadcastPlaying = true
         }
-        val sysFreq = mainActivity.pollSystemRadioFrequency()
+        val sysFreq = hostActivity.pollSystemRadioFrequency()
         if (sysFreq.isNotEmpty()) {
             currentRadioText = sysFreq
             prefs.edit().putString("last_radio_text", sysFreq).apply()
@@ -1332,7 +1337,7 @@ class AgamaDashboardView(
     }
 
     private fun drawCarPlayNavigationHub(canvas: Canvas, cx: Float, cy: Float, rHub: Float) {
-        val isConnected = carPlayExplicitlyConnected || mainActivity.isCarPlayConnectedOrActive()
+        val isConnected = carPlayExplicitlyConnected || hostActivity.isCarPlayConnectedOrActive()
 
         if (!isConnected) {
             drawGlossySubaruBadge(canvas, cx, cy - rHub * 0.06f, rHub * 0.72f, rHub * 0.39f)
@@ -1625,8 +1630,10 @@ class AgamaDashboardView(
         return try {
             val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             if (wm != null && wm.isWifiEnabled) {
+                @Suppress("DEPRECATION")
                 val info = wm.connectionInfo
                 if (info != null && info.networkId != -1) {
+                    @Suppress("DEPRECATION")
                     WifiManager.calculateSignalLevel(info.rssi, 4)
                 } else {
                     0
@@ -1658,7 +1665,7 @@ class AgamaDashboardView(
     }
 
     private fun drawBluetoothStatusIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
-        val connected = mainActivity.isBluetoothDeviceConnected()
+        val connected = hostActivity.isBluetoothDeviceConnected()
         val dimColor = Color.argb(75, Color.red(secondaryColor), Color.green(secondaryColor), Color.blue(secondaryColor))
         val activeColor = if (connected) secondaryColor else dimColor
 
@@ -1814,16 +1821,13 @@ class AgamaDashboardView(
                     pendingCenterSingleTap = false
                     showCenterHubDisplayPicker()
                 } else {
-                    // Proper Double-Tap vs Single-Tap disambiguation!
                     if (pendingCenterSingleTap) {
-                        // Second tap arrived within 320ms -> Double-Tap!
                         tapHandler.removeCallbacks(centerSingleTapRunnable)
                         pendingCenterSingleTap = false
-                        if (!mainActivity.launchCarPlayDirect(prefs)) {
+                        if (!hostActivity.launchCarPlayDirect(prefs)) {
                             showVisualAppDrawer(assignToSlot = "CARPLAY")
                         }
                     } else {
-                        // First tap -> wait 320ms to see if a second tap follows
                         pendingCenterSingleTap = true
                         tapHandler.postDelayed(centerSingleTapRunnable, 320L)
                     }
@@ -1842,7 +1846,7 @@ class AgamaDashboardView(
 
             "TEMP_TOP_RIGHT" -> {
                 Toast.makeText(context, "Refreshing live outdoor temperature...", Toast.LENGTH_SHORT).show()
-                mainActivity.refreshWeatherIfNeeded(force = true, showToast = true)
+                hostActivity.refreshWeatherIfNeeded(force = true, showToast = true)
             }
 
             "WIFI_BOTTOM_LEFT" -> {
@@ -1918,7 +1922,7 @@ class AgamaDashboardView(
             isRadioActive = true
             isMediaBroadcastPlaying = false
             prefs.edit().putBoolean("is_radio_active", true).apply()
-            val polled = mainActivity.pollSystemRadioFrequency()
+            val polled = hostActivity.pollSystemRadioFrequency()
             if (polled.isNotEmpty()) {
                 currentRadioText = polled
                 prefs.edit().putString("last_radio_text", polled).apply()
@@ -2033,6 +2037,7 @@ class AgamaDashboardView(
     private fun showVisualAppDrawer(assignToSlot: String?) {
         val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
+        @Suppress("DEPRECATION")
         val apps = pm.queryIntentActivities(mainIntent, 0).sortedBy { it.loadLabel(pm).toString().lowercase() }
 
         val screenW = width.takeIf { it > 0 } ?: 1024
@@ -2106,4 +2111,180 @@ class AgamaDashboardView(
 
         gridView.adapter = adapter
         gridView.setOnItemClickListener { _, _, position, _ ->
-            val actInfo = apps
+            val actInfo = apps[position].activityInfo
+            val chosenPkg = actInfo.packageName
+            val chosenCls = actInfo.name
+            val chosenName = apps[position].loadLabel(pm).toString()
+            alertDialog.dismiss()
+
+            val exactIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                component = ComponentName(chosenPkg, chosenCls)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+            }
+
+            if (assignToSlot != null) {
+                prefs.edit()
+                    .putString("pkg_$assignToSlot", chosenPkg)
+                    .putString("cls_$assignToSlot", chosenCls)
+                    .apply()
+                Toast.makeText(context, "$assignToSlot assigned to $chosenName", Toast.LENGTH_SHORT).show()
+                try {
+                    context.startActivity(exactIntent)
+                } catch (_: Exception) {
+                    pm.getLaunchIntentForPackage(chosenPkg)?.let { context.startActivity(it) }
+                }
+            } else {
+                try {
+                    context.startActivity(exactIntent)
+                } catch (_: Exception) {
+                    pm.getLaunchIntentForPackage(chosenPkg)?.let { context.startActivity(it) }
+                }
+            }
+        }
+
+        val title = if (assignToSlot != null) "Select App for $assignToSlot" else "All Applications"
+        alertDialog = AlertDialog.Builder(context)
+            .setTitle(title)
+            .setView(gridView)
+            .setNegativeButton("Close", null)
+            .create()
+
+        alertDialog.show()
+        alertDialog.window?.setLayout(
+            (screenW * 0.92f).toInt(),
+            (screenH * 0.86f).toInt()
+        )
+    }
+
+    private fun launchAssignedApp(slotKey: String) {
+        if (slotKey == "CARPLAY") {
+            if (hostActivity.launchCarPlayDirect(prefs)) {
+                return
+            }
+        }
+
+        val pkg = prefs.getString("pkg_$slotKey", null)
+        val cls = prefs.getString("cls_$slotKey", null)
+
+        if (!pkg.isNullOrBlank() && !cls.isNullOrBlank()) {
+            try {
+                val exactIntent = Intent(Intent.ACTION_MAIN).apply {
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                    component = ComponentName(pkg, cls)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                }
+                context.startActivity(exactIntent)
+                return
+            } catch (_: Exception) {}
+        }
+
+        if (!pkg.isNullOrBlank()) {
+            val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
+            if (launchIntent != null) {
+                context.startActivity(launchIntent)
+                return
+            }
+        }
+
+        showVisualAppDrawer(assignToSlot = slotKey)
+    }
+
+    private fun showSkinCustomizerDialog() {
+        val themes = arrayOf(
+            "Legacy Default (Original Installation Theme)",
+            "Deep Ruby Red & Blue",
+            "Subaru World Rally Blue & Gold",
+            "Subaru Wilderness Gold & Blue",
+            "Cyber Ice Cyan & White",
+            "Emerald Matrix Green"
+        )
+        AlertDialog.Builder(context)
+            .setTitle("Customize Launcher Theme")
+            .setItems(themes) { _, which ->
+                val (pri, sec) = when (which) {
+                    0 -> defaultPrimaryRed to defaultSecondaryBlue
+                    1 -> Color.parseColor("#C8102E") to Color.parseColor("#4A90E2")
+                    2 -> Color.parseColor("#2B7DE9") to Color.parseColor("#E5B842")
+                    3 -> Color.parseColor("#E09F24") to Color.parseColor("#4A90E2")
+                    4 -> Color.parseColor("#00BCD4") to Color.parseColor("#FFFFFF")
+                    else -> Color.parseColor("#2ECC71") to Color.parseColor("#4A90E2")
+                }
+                primaryColor = pri
+                secondaryColor = sec
+                innerRingColor = defaultInnerRingGray
+                wingBaseColor = defaultWingBaseGray
+
+                prefs.edit()
+                    .putInt("primary_color_v3", pri)
+                    .putInt("secondary_color_v3", sec)
+                    .putInt("inner_ring_color_v3", innerRingColor)
+                    .putInt("wing_base_color_v3", wingBaseColor)
+                    .apply()
+                invalidate()
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showEscapeHatchDialog() {
+        val options = arrayOf(
+            "Switch / Revert to Stock XYAuto Launcher",
+            "Open Android System Settings",
+            "Center Circle Display Mode (Subaru / MPH / Clock / CarPlay Nav)",
+            "Radio Broadcast Sniffer (Diagnostics)",
+            "Reset All Custom Labels, Icons & Shortcuts"
+        )
+        AlertDialog.Builder(context)
+            .setTitle("Eye of Sauron Car Launcher Options")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> LauncherUtils.openHomeSettings(context)
+                    1 -> context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    2 -> showCenterHubDisplayPicker()
+                    3 -> showRadioDiagnosticDialog()
+                    4 -> {
+                        for (k in wingKeys) {
+                            prefs.edit()
+                                .remove("pkg_$k")
+                                .remove("cls_$k")
+                                .remove("label_$k")
+                                .remove("icon_$k")
+                                .apply()
+                        }
+                        primaryColor = defaultPrimaryRed
+                        secondaryColor = defaultSecondaryBlue
+                        innerRingColor = defaultInnerRingGray
+                        wingBaseColor = defaultWingBaseGray
+                        prefs.edit()
+                            .putInt("primary_color_v3", defaultPrimaryRed)
+                            .putInt("secondary_color_v3", defaultSecondaryBlue)
+                            .apply()
+                        invalidate()
+                        Toast.makeText(context, "All customizations reset to Legacy Default", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showRadioDiagnosticDialog() {
+        val polled = hostActivity.pollSystemRadioFrequency().ifEmpty { "None detected in getprop/Settings" }
+        val logs = if (hostActivity.recentBroadcastLog.isEmpty()) {
+            "No media/radio broadcasts captured yet."
+        } else {
+            hostActivity.recentBroadcastLog.joinToString("\n\n")
+        }
+
+        val message = "Polled System Frequency: $polled\n" +
+                "Active Radio Text: ${currentRadioText.ifEmpty { "Empty" }}\n\n" +
+                "Recent Broadcasts:\n$logs"
+
+        AlertDialog.Builder(context)
+            .setTitle("Radio Broadcast Sniffer")
+            .setMessage(message)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+}
