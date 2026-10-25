@@ -2,7 +2,6 @@ package com.custom.carlauncher
 
 import android.Manifest
 import android.app.ActivityManager
-import android.app.ActivityOptions
 import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothProfile
@@ -23,6 +22,8 @@ import android.media.AudioManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
@@ -320,7 +321,6 @@ class MainActivity : AppCompatActivity() {
             addAction("com.bambuna.podcastaddict.service.player.update")
             addAction("de.danoeh.antennapod.intent.PLAYBACK_STATUS")
 
-            // XYAuto / MCU Radio & Bluetooth Broadcasts
             addAction("com.microntek.music.toast")
             addAction("com.microntek.music.report")
             addAction("com.xyauto.music.metachanged")
@@ -344,14 +344,12 @@ class MainActivity : AppCompatActivity() {
             addAction("cn.abel.action.broadcast")
             addAction("com.ts.main.radio.info")
 
-            // CarPlay / Zlink / Tlink / Navigation Broadcasts
             addAction("com.zjinnova.zlink")
             addAction("com.zjinnova.zlink.action.BACK_CAR")
             addAction("com.xyauto.broadcast.NAVI_INFO")
             addAction("AUTONAVI_STANDARD_BROADCAST_SEND")
             addAction("com.google.android.apps.maps.NAVIGATION_UPDATE")
 
-            // Bluetooth state changes
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
             addAction("android.bluetooth.device.action.ACL_CONNECTED")
@@ -557,13 +555,8 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
-    /**
-     * Checks if Apple CarPlay (Zlink / Tlink / SpeedPlay / CarLink) is connected or active,
-     * or if a phone is actively linked via Bluetooth/USB for CarPlay navigation.
-     */
     fun isCarPlayConnectedOrActive(): Boolean {
         try {
-            // Check XYAuto / Zlink system properties
             val propKeys = arrayOf(
                 "sys.zlink.connected", "persist.sys.zlink.connected",
                 "sys.carplay.connected", "xy.carplay.state"
@@ -576,7 +569,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Check if Zlink / Tlink / CarPlay process is running in memory
             val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             @Suppress("DEPRECATION")
             val procs = am.runningAppProcesses.orEmpty()
@@ -590,45 +582,84 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (_: Exception) {}
 
-        // Also treat active Bluetooth connection as ready for CarPlay Navigation
         return isBluetoothDeviceConnected()
     }
 
     /**
-     * Launches the user's CarPlay / Navigation app (attempts windowed/overlay bounds first,
-     * then falls back to full launch).
+     * Intelligently locates and launches the true CarPlay Projection Activity on XYAuto head units,
+     * explicitly bypassing Android Settings or stub configuration screens.
      */
-    fun launchCarPlayNavigationView(prefs: SharedPreferences, rHubPx: Int) {
+    fun launchCarPlayDirect(prefs: SharedPreferences): Boolean {
         val pm = packageManager
-        val knownCarPlayPkgs = listOf(
-            prefs.getString("pkg_CARPLAY", null),
-            "com.zjinnova.zlink",
-            "com.car.tlink",
-            "cn.manstep.phonemirrorBox",
-            "com.suding.speedplay",
-            "com.google.android.apps.maps"
-        ).filterNotNull()
 
-        var targetIntent: Intent? = null
-        for (pkg in knownCarPlayPkgs) {
-            targetIntent = pm.getLaunchIntentForPackage(pkg)
-            if (targetIntent != null) break
-        }
+        // 1. Fire XYAuto / Zlink wake-up broadcasts just like the stock XYAuto launcher does
+        try {
+            sendBroadcast(Intent("com.zjinnova.zlink.action.OUT_GOTO_CARPLAY"))
+            sendBroadcast(Intent("com.xyauto.broadcast.CARPLAY_START"))
+            sendBroadcast(Intent("com.tw.carplay.start"))
+        } catch (_: Exception) {}
 
-        if (targetIntent != null) {
-            try {
-                targetIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
-                val cx = resources.displayMetrics.widthPixels / 2
-                val cy = resources.displayMetrics.heightPixels / 2
-                val rect = Rect(cx - rHubPx, cy - rHubPx, cx + rHubPx, cy + rHubPx)
-                val opts = ActivityOptions.makeBasic().setLaunchBounds(rect)
-                startActivity(targetIntent, opts.toBundle())
-            } catch (_: Exception) {
-                startActivity(targetIntent)
+        // 2. Check if user mapped an exact Component (Package + Class) that is NOT Android Settings
+        val savedPkg = prefs.getString("pkg_CARPLAY", null)
+        val savedCls = prefs.getString("cls_CARPLAY", null)
+        if (!savedPkg.isNullOrBlank() && !savedPkg.contains("com.android.settings")) {
+            if (!savedCls.isNullOrBlank() && !savedCls.contains("setting", ignoreCase = true)) {
+                try {
+                    val compIntent = Intent.makeMainActivity(ComponentName(savedPkg, savedCls)).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                    }
+                    startActivity(compIntent)
+                    return true
+                } catch (_: Exception) {}
             }
-        } else {
-            Toast.makeText(this, "Long-press CARPLAY wing button to assign your CarPlay/Map app", Toast.LENGTH_SHORT).show()
         }
+
+        // 3. Scan all installed activities on the head unit for the true CarPlay / Zlink / Tlink projection screen
+        val mainIntent = Intent(Intent.ACTION_MAIN, null)
+        val allActivities = pm.queryIntentActivities(mainIntent, 0)
+
+        val carPlayKeywords = listOf(
+            "zlink", "tlink", "carplay", "speedplay", "carlink",
+            "autokit", "phonemirrorbox", "icar", "easyconn", "carbit"
+        )
+
+        for (keyword in carPlayKeywords) {
+            for (resolveInfo in allActivities) {
+                val actInfo = resolveInfo.activityInfo ?: continue
+                val pkg = actInfo.packageName.lowercase()
+                val cls = actInfo.name.lowercase()
+                val label = resolveInfo.loadLabel(pm).toString().lowercase()
+
+                // Never launch Android Settings or a Settings sub-activity
+                if (pkg == "com.android.settings" || cls.contains("setting")) continue
+
+                if (pkg.contains(keyword) || cls.contains(keyword) || label.contains(keyword)) {
+                    try {
+                        val comp = ComponentName(actInfo.packageName, actInfo.name)
+                        val launch = Intent.makeMainActivity(comp).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                        }
+                        // Save the discovered projection component for instant future launches
+                        prefs.edit()
+                            .putString("pkg_CARPLAY", actInfo.packageName)
+                            .putString("cls_CARPLAY", actInfo.name)
+                            .apply()
+                        startActivity(launch)
+                        return true
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+
+        // 4. Fallback: Try Apple Maps / Google Maps if no CarPlay bridge activity matched
+        val mapsIntent = pm.getLaunchIntentForPackage("com.google.android.apps.maps")
+        if (mapsIntent != null) {
+            mapsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(mapsIntent)
+            return true
+        }
+
+        return false
     }
 
     fun pollSystemRadioFrequency(): String {
@@ -737,14 +768,13 @@ class AgamaDashboardView(
     // 0 = Glossy Subaru Emblem (Default)
     // 1 = Live GPS Speedometer (MPH)
     // 2 = Digital Clock + Speed + Compass
-    // 3 = Apple CarPlay Navigation Hub (when connected)
+    // 3 = Apple CarPlay Navigation Hub
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
     private var currentBearingDeg = 0f
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
     private var temperatureF = prefs.getInt("temp_f", 59)
 
-    // CarPlay Navigation State
     private var carPlayExplicitlyConnected = false
     private var navNextRoad: String = prefs.getString("nav_road", "") ?: ""
     private var navDistance: String = prefs.getString("nav_dist", "") ?: ""
@@ -1301,16 +1331,10 @@ class AgamaDashboardView(
         }
     }
 
-    /**
-     * Mode 3: Apple CarPlay Navigation Display inside the Center Hub.
-     * Shows live CarPlay Navigation telemetry, directional vector map grid, and heading when connected;
-     * or falls back to the Subaru emblem with a subtle "CarPlay Nav Standby" indicator if disconnected.
-     */
     private fun drawCarPlayNavigationHub(canvas: Canvas, cx: Float, cy: Float, rHub: Float) {
         val isConnected = carPlayExplicitlyConnected || mainActivity.isCarPlayConnectedOrActive()
 
         if (!isConnected) {
-            // If CarPlay isn't connected yet, show the Subaru badge + subtle standby caption
             drawGlossySubaruBadge(canvas, cx, cy - rHub * 0.06f, rHub * 0.72f, rHub * 0.39f)
             textPaint.textSize = rHub * 0.11f
             textPaint.color = secondaryColor
@@ -1318,12 +1342,10 @@ class AgamaDashboardView(
             return
         }
 
-        // Clip to the circular hub to draw the CarPlay Navigation HUD
         canvas.save()
         val clipPath = Path().apply { addCircle(cx, cy, rHub - 4f, Path.Direction.CW) }
         canvas.clipPath(clipPath)
 
-        // Dark CarPlay Map Night-Mode Perspective Grid
         fillPaint.color = Color.parseColor("#0B1320")
         canvas.drawCircle(cx, cy, rHub, fillPaint)
 
@@ -1335,12 +1357,10 @@ class AgamaDashboardView(
             canvas.drawLine(cx - rHub, cy + i * gridStep, cx + rHub, cy + i * gridStep, iconPaint)
         }
 
-        // Glowing Route Path Line
         iconPaint.strokeWidth = 10f
         iconPaint.color = Color.parseColor("#2B7DE9")
         canvas.drawLine(cx, cy + rHub, cx, cy - rHub * 0.12f, iconPaint)
 
-        // 3D CarPlay Navigation Arrow in the Center
         val arrowY = cy - rHub * 0.10f
         val arrowSize = rHub * 0.24f
         canvas.save()
@@ -1357,10 +1377,8 @@ class AgamaDashboardView(
         canvas.drawPath(navArrow, thinWhiteStrokePaint)
         canvas.restore()
 
-        // Top Banner: CarPlay Navigation Status
         drawRedOutlinedText(canvas, "CARPLAY NAV", cx, cy - rHub * 0.56f, rHub * 0.14f)
 
-        // Middle-Bottom Readout: Next Turn / Street Name + Distance + Live Speed
         val roadLabel = if (navNextRoad.isNotEmpty()) navNextRoad else "Heading $compassDir • $currentMph MPH"
         textPaint.color = Color.WHITE
         textPaint.textSize = rHub * 0.14f
@@ -1369,7 +1387,7 @@ class AgamaDashboardView(
         val subLabel = if (navDistance.isNotEmpty()) {
             "$navDistance  •  $currentMph MPH"
         } else {
-            "Double-tap for Full CarPlay Map"
+            "Double-tap to Open CarPlay Map"
         }
         textPaint.color = secondaryColor
         textPaint.textSize = rHub * 0.105f
@@ -1680,8 +1698,16 @@ class AgamaDashboardView(
         }
     }
 
+    // --- Touch, Single-Tap, Double-Tap & Long-Press Detection ---
     private var downTime = 0L
-    private var lastCenterTapTime = 0L
+    private val tapHandler = Handler(Looper.getMainLooper())
+    private var pendingCenterSingleTap = false
+    private val centerSingleTapRunnable = Runnable {
+        pendingCenterSingleTap = false
+        centerMode = (centerMode + 1) % 4
+        prefs.edit().putInt("center_mode", centerMode).apply()
+        invalidate()
+    }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val x = event.x
@@ -1784,19 +1810,23 @@ class AgamaDashboardView(
         when (zone) {
             "CENTER_HUB" -> {
                 if (isLongPress) {
+                    tapHandler.removeCallbacks(centerSingleTapRunnable)
+                    pendingCenterSingleTap = false
                     showCenterHubDisplayPicker()
                 } else {
-                    val now = System.currentTimeMillis()
-                    if (centerMode == 3 && (now - lastCenterTapTime) < 420L) {
-                        // Double-tap while in CarPlay Nav mode opens live CarPlay Map view
-                        mainActivity.launchCarPlayNavigationView(prefs, (height * 0.29f).toInt())
+                    // Proper Double-Tap vs Single-Tap disambiguation!
+                    if (pendingCenterSingleTap) {
+                        // Second tap arrived within 320ms -> Double-Tap!
+                        tapHandler.removeCallbacks(centerSingleTapRunnable)
+                        pendingCenterSingleTap = false
+                        if (!mainActivity.launchCarPlayDirect(prefs)) {
+                            showVisualAppDrawer(assignToSlot = "CARPLAY")
+                        }
                     } else {
-                        // Cycle through 4 center display modes (0: Subaru, 1: MPH, 2: Clock, 3: CarPlay Nav)
-                        centerMode = (centerMode + 1) % 4
-                        prefs.edit().putInt("center_mode", centerMode).apply()
-                        invalidate()
+                        // First tap -> wait 320ms to see if a second tap follows
+                        pendingCenterSingleTap = true
+                        tapHandler.postDelayed(centerSingleTapRunnable, 320L)
                     }
-                    lastCenterTapTime = now
                 }
             }
             "VOL_DOWN" -> audioManager.adjustStreamVolume(
@@ -1860,10 +1890,6 @@ class AgamaDashboardView(
         }
     }
 
-    /**
-     * Long-pressing the Center Circle lets you directly pick any of the 4 Center Hub Display Modes
-     * (including Apple CarPlay Navigation) or jump to the Home Switcher.
-     */
     private fun showCenterHubDisplayPicker() {
         val modes = arrayOf(
             "1. Subaru Emblem (Default)",
@@ -2080,139 +2106,4 @@ class AgamaDashboardView(
 
         gridView.adapter = adapter
         gridView.setOnItemClickListener { _, _, position, _ ->
-            val chosenPkg = apps[position].activityInfo.packageName
-            val chosenName = apps[position].loadLabel(pm).toString()
-            alertDialog.dismiss()
-
-            if (assignToSlot != null) {
-                prefs.edit().putString("pkg_$assignToSlot", chosenPkg).apply()
-                Toast.makeText(context, "$assignToSlot assigned to $chosenName", Toast.LENGTH_SHORT).show()
-                pm.getLaunchIntentForPackage(chosenPkg)?.let { context.startActivity(it) }
-            } else {
-                pm.getLaunchIntentForPackage(chosenPkg)?.let { context.startActivity(it) }
-            }
-        }
-
-        val title = if (assignToSlot != null) "Select App for $assignToSlot" else "All Applications"
-        alertDialog = AlertDialog.Builder(context)
-            .setTitle(title)
-            .setView(gridView)
-            .setNegativeButton("Close", null)
-            .create()
-
-        alertDialog.show()
-        alertDialog.window?.setLayout(
-            (screenW * 0.92f).toInt(),
-            (screenH * 0.86f).toInt()
-        )
-    }
-
-    private fun launchAssignedApp(slotKey: String) {
-        val pkg = prefs.getString("pkg_$slotKey", null)
-        if (pkg != null) {
-            val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
-            if (launchIntent != null) {
-                context.startActivity(launchIntent)
-                return
-            }
-        }
-        showVisualAppDrawer(assignToSlot = slotKey)
-    }
-
-    private fun showSkinCustomizerDialog() {
-        val themes = arrayOf(
-            "Legacy Default (Original Installation Theme)",
-            "Deep Ruby Red & Blue",
-            "Subaru World Rally Blue & Gold",
-            "Subaru Wilderness Gold & Blue",
-            "Cyber Ice Cyan & White",
-            "Emerald Matrix Green"
-        )
-        AlertDialog.Builder(context)
-            .setTitle("Customize Launcher Theme")
-            .setItems(themes) { _, which ->
-                val (pri, sec) = when (which) {
-                    0 -> defaultPrimaryRed to defaultSecondaryBlue
-                    1 -> Color.parseColor("#C8102E") to Color.parseColor("#4A90E2")
-                    2 -> Color.parseColor("#2B7DE9") to Color.parseColor("#E5B842")
-                    3 -> Color.parseColor("#E09F24") to Color.parseColor("#4A90E2")
-                    4 -> Color.parseColor("#00BCD4") to Color.parseColor("#FFFFFF")
-                    else -> Color.parseColor("#2ECC71") to Color.parseColor("#4A90E2")
-                }
-                primaryColor = pri
-                secondaryColor = sec
-                innerRingColor = defaultInnerRingGray
-                wingBaseColor = defaultWingBaseGray
-
-                prefs.edit()
-                    .putInt("primary_color_v3", pri)
-                    .putInt("secondary_color_v3", sec)
-                    .putInt("inner_ring_color_v3", innerRingColor)
-                    .putInt("wing_base_color_v3", wingBaseColor)
-                    .apply()
-                invalidate()
-            }
-            .setNegativeButton("Close", null)
-            .show()
-    }
-
-    private fun showEscapeHatchDialog() {
-        val options = arrayOf(
-            "Switch / Revert to Stock XYAuto Launcher",
-            "Open Android System Settings",
-            "Center Circle Display Mode (Subaru / MPH / Clock / CarPlay Nav)",
-            "Radio Broadcast Sniffer (Diagnostics)",
-            "Reset All Custom Labels, Icons & Shortcuts"
-        )
-        AlertDialog.Builder(context)
-            .setTitle("Eye of Sauron Car Launcher Options")
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> LauncherUtils.openHomeSettings(context)
-                    1 -> context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    2 -> showCenterHubDisplayPicker()
-                    3 -> showRadioDiagnosticDialog()
-                    4 -> {
-                        for (k in wingKeys) {
-                            prefs.edit()
-                                .remove("pkg_$k")
-                                .remove("label_$k")
-                                .remove("icon_$k")
-                                .apply()
-                        }
-                        primaryColor = defaultPrimaryRed
-                        secondaryColor = defaultSecondaryBlue
-                        innerRingColor = defaultInnerRingGray
-                        wingBaseColor = defaultWingBaseGray
-                        prefs.edit()
-                            .putInt("primary_color_v3", defaultPrimaryRed)
-                            .putInt("secondary_color_v3", defaultSecondaryBlue)
-                            .apply()
-                        invalidate()
-                        Toast.makeText(context, "All customizations reset to Legacy Default", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun showRadioDiagnosticDialog() {
-        val polled = mainActivity.pollSystemRadioFrequency().ifEmpty { "None detected in getprop/Settings" }
-        val logs = if (mainActivity.recentBroadcastLog.isEmpty()) {
-            "No media/radio broadcasts captured yet."
-        } else {
-            mainActivity.recentBroadcastLog.joinToString("\n\n")
-        }
-
-        val message = "Polled System Frequency: $polled\n" +
-                "Active Radio Text: ${currentRadioText.ifEmpty { "Empty" }}\n\n" +
-                "Recent Broadcasts:\n$logs"
-
-        AlertDialog.Builder(context)
-            .setTitle("Radio Broadcast Sniffer")
-            .setMessage(message)
-            .setPositiveButton("Close", null)
-            .show()
-    }
-}
+            val actInfo = apps
