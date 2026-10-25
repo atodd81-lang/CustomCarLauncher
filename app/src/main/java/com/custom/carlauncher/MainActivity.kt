@@ -1,5 +1,6 @@
 package com.custom.carlauncher
 
+import android.app.ActivityManager
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -28,6 +29,11 @@ import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.*
@@ -38,12 +44,26 @@ class MainActivity : AppCompatActivity() {
     private lateinit var locationManager: LocationManager
     private lateinit var dashboardView: AgamaDashboardView
 
-    // Comprehensive receiver for Music, Podcasts, and XYAuto/MCU FM/AM Radio broadcasts
+    private var lastWeatherFetchTime = 0L
+    private var lastLat: Double? = null
+    private var lastLon: Double? = null
+
+    // Diagnostic log of the last incoming broadcasts to help identify proprietary XYAuto radio intents
+    val recentBroadcastLog = LinkedList<String>()
+
     private val mediaAndRadioReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent == null) return
             val action = intent.action.orEmpty()
             val bundle = intent.extras
+
+            // Record in diagnostic sniffer log (ignore standard battery/time ticks)
+            if (!action.contains("BATTERY") && !action.contains("TIME_TICK")) {
+                val keysSummary = bundle?.keySet()?.joinToString(", ") { k -> "$k=${bundle.get(k)}" } ?: "no-extras"
+                val entry = "[${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())}] $action ($keysSummary)"
+                recentBroadcastLog.addFirst(entry)
+                while (recentBroadcastLog.size > 18) recentBroadcastLog.removeLast()
+            }
 
             // 1. Check if the broadcast is a Radio power-off / stop signal
             if (action.contains("radio", ignoreCase = true) &&
@@ -60,26 +80,24 @@ class MainActivity : AppCompatActivity() {
             // 2. Check if broadcast is from the Head Unit's FM/AM Radio app or MCU
             val isRadioIntent = action.contains("radio", ignoreCase = true) ||
                     action.contains("fm", ignoreCase = true) ||
-                    intent.hasExtra("freq") ||
-                    intent.hasExtra("frequency") ||
-                    intent.hasExtra("radio_freq") ||
-                    intent.hasExtra("cur_freq") ||
-                    intent.hasExtra("channel_freq")
+                    action.contains("mcu", ignoreCase = true) ||
+                    action.contains("tw.", ignoreCase = true) ||
+                    hasAnyKey(bundle, "freq", "frequency", "radio_freq", "cur_freq", "channel_freq", "fm_freq", "rds", "ps", "pty")
 
             if (isRadioIntent) {
                 val rawFreq = extractFirstString(
                     bundle,
-                    "freq", "frequency", "radio_freq", "cur_freq", "channel_freq", "channel", "fm_freq"
+                    "freq", "frequency", "radio_freq", "cur_freq", "channel_freq", "channel", "fm_freq", "mFreq", "value"
                 )
-                val band = extractFirstString(bundle, "band", "radio_band", "wave", "type_band")
+                val band = extractFirstString(bundle, "band", "radio_band", "wave", "type_band", "mBand")
                     .ifEmpty { "FM" }
                 val callLetters = extractFirstString(
                     bundle,
-                    "ps", "rds_ps", "call", "station", "radio_name", "station_name", "channel_name", "name"
+                    "ps", "rds_ps", "call", "station", "radio_name", "station_name", "channel_name", "name", "ps_name"
                 )
                 val stationType = extractFirstString(
                     bundle,
-                    "pty", "rds_pty", "genre", "program_type", "station_type", "tp"
+                    "pty", "rds_pty", "genre", "program_type", "station_type", "tp", "pty_name"
                 )
                 val radioText = extractFirstString(
                     bundle,
@@ -88,7 +106,6 @@ class MainActivity : AppCompatActivity() {
 
                 val formattedFreq = formatRadioFrequency(rawFreq, band)
 
-                // Assemble Station Number, Call Letters, and Station Type / RDS Info
                 val parts = mutableListOf<String>()
                 if (formattedFreq.isNotEmpty()) parts.add(formattedFreq)
                 if (callLetters.isNotEmpty() && !callLetters.equals(formattedFreq, ignoreCase = true)) {
@@ -101,20 +118,22 @@ class MainActivity : AppCompatActivity() {
                     parts.add(radioText)
                 }
 
-                // Fallback: scan any other string/number extras if standard keys were empty
+                // Fallback: scan any numeric/frequency-looking value inside the bundle
                 if (parts.isEmpty() && bundle != null) {
                     for (key in bundle.keySet()) {
                         val v = bundle.get(key)?.toString()?.trim().orEmpty()
                         if (v.isNotEmpty() && v != "true" && v != "false") {
                             val maybeFreq = formatRadioFrequency(v, band)
-                            parts.add(maybeFreq.ifEmpty { v })
+                            if (maybeFreq.isNotEmpty()) parts.add(maybeFreq)
                         }
                     }
                 }
 
-                val fullRadioString = parts.joinToString("  •  ")
-                dashboardView.updateRadioInfo(fullRadioString, true)
-                return
+                if (parts.isNotEmpty()) {
+                    val fullRadioString = parts.joinToString("  •  ")
+                    dashboardView.updateRadioInfo(fullRadioString, true)
+                    return
+                }
             }
 
             // 3. Otherwise process as Music / Podcast / Media App Metadata
@@ -147,8 +166,20 @@ class MainActivity : AppCompatActivity() {
                 else -> true
             }
 
-            dashboardView.updateMediaInfo(track, artist, album, isPlaying)
+            if (track.isNotEmpty() || artist.isNotEmpty() || album.isNotEmpty()) {
+                dashboardView.updateMediaInfo(track, artist, album, isPlaying)
+            }
         }
+    }
+
+    private fun hasAnyKey(bundle: Bundle?, vararg keys: String): Boolean {
+        if (bundle == null) return false
+        for (k in keys) {
+            for (actual in bundle.keySet()) {
+                if (actual.contains(k, ignoreCase = true)) return true
+            }
+        }
+        return false
     }
 
     private fun extractFirstString(bundle: Bundle?, vararg keys: String): String {
@@ -164,20 +195,29 @@ class MainActivity : AppCompatActivity() {
         return ""
     }
 
-    private fun formatRadioFrequency(raw: String?, band: String): String {
+    fun formatRadioFrequency(raw: String?, band: String): String {
         if (raw.isNullOrBlank()) return ""
         val clean = raw.replace("MHz", "", ignoreCase = true)
             .replace("kHz", "", ignoreCase = true)
+            .replace("FM1", "", ignoreCase = true)
+            .replace("FM2", "", ignoreCase = true)
+            .replace("FM3", "", ignoreCase = true)
             .replace("FM", "", ignoreCase = true)
             .replace("AM", "", ignoreCase = true)
             .trim()
-        val num = clean.toDoubleOrNull() ?: return "$raw $band".trim()
+        val num = clean.toDoubleOrNull() ?: return ""
         return when {
+            // e.g. 9230 -> 92.3 FM
             num in 8700.0..10850.0 -> String.format(Locale.US, "%.1f %s", num / 100.0, band.ifEmpty { "FM" })
+            // e.g. 92300 -> 92.3 FM
             num in 87000.0..108500.0 -> String.format(Locale.US, "%.1f %s", num / 1000.0, band.ifEmpty { "FM" })
+            // e.g. 923 -> 92.3 FM
+            num in 875.0..1085.0 -> String.format(Locale.US, "%.1f %s", num / 10.0, band.ifEmpty { "FM" })
+            // e.g. 92.3 -> 92.3 FM
             num in 87.0..108.5 -> String.format(Locale.US, "%.1f %s", num, band.ifEmpty { "FM" })
+            // AM Band
             num in 500.0..1750.0 -> String.format(Locale.US, "%.0f AM", num)
-            else -> "$raw $band".trim()
+            else -> ""
         }
     }
 
@@ -191,13 +231,13 @@ class MainActivity : AppCompatActivity() {
         setContentView(dashboardView)
 
         registerMediaAndRadioBroadcasts()
-        startGpsUpdates()
+        startGpsAndWeatherUpdates()
     }
 
     override fun onResume() {
         super.onResume()
-        // Refresh active audio state immediately whenever returning to the home screen
-        dashboardView.syncAudioStateOnResume()
+        dashboardView.syncAudioAndRadioState()
+        refreshWeatherIfNeeded(force = false)
     }
 
     private fun registerMediaAndRadioBroadcasts() {
@@ -223,7 +263,7 @@ class MainActivity : AppCompatActivity() {
             addAction("com.bambuna.podcastaddict.service.player.update")
             addAction("de.danoeh.antennapod.intent.PLAYBACK_STATUS")
 
-            // XYAuto / FYT / Microntek / Head Unit Music & Radio MCU Broadcasts
+            // XYAuto / Allwinner / Topway / FYT / Microntek Radio & MCU Broadcasts
             addAction("com.microntek.music.toast")
             addAction("com.microntek.music.report")
             addAction("com.xyauto.music.metachanged")
@@ -232,8 +272,13 @@ class MainActivity : AppCompatActivity() {
             addAction("com.xyauto.radio.metachanged")
             addAction("com.xyauto.broadcast.radio")
             addAction("com.xyauto.action.RADIO_INFO")
+            addAction("com.xyauto.Radio.Action")
+            addAction("com.SwcApplication.radio")
+            addAction("com.tw.radio.info")
+            addAction("com.tw.broadcast.RADIO")
             addAction("com.microntek.radio.report")
             addAction("com.android.fmradio.metachanged")
+            addAction("com.android.fmradio.FMRADIO_STATE_CHANGED")
             addAction("com.caf.fmradio.FMRADIO_STATE_CHANGED")
             addAction("com.fyt.radio")
             addAction("com.syu.ms.radio")
@@ -241,6 +286,7 @@ class MainActivity : AppCompatActivity() {
             addAction("com.glsx.boot.AC_RADIO_INFO")
             addAction("cn.abel.action.broadcast")
             addAction("com.ts.main.radio.info")
+            addAction("com. ATC.radio.info")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(mediaAndRadioReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -256,23 +302,161 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
-    private fun startGpsUpdates() {
+    private fun startGpsAndWeatherUpdates() {
         try {
+            // Check last known GPS location immediately so temperature can fetch right away at startup
+            val lastLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            if (lastLoc != null) {
+                lastLat = lastLoc.latitude
+                lastLon = lastLoc.longitude
+                refreshWeatherIfNeeded(force = true)
+            }
+
             locationManager.requestLocationUpdates(
                 LocationManager.GPS_PROVIDER,
                 500L,
                 0.5f,
                 object : LocationListener {
                     override fun onLocationChanged(location: Location) {
+                        lastLat = location.latitude
+                        lastLon = location.longitude
+
                         val mph = if (location.hasSpeed()) (location.speed * 2.23694f).toInt() else 0
-                        val bearing = if (location.hasBearing()) location.bearing else null
-                        dashboardView.updateGpsData(mph, bearing)
+
+                        // #3: Only update forward-facing car direction when moving (> 2 MPH)
+                        // so stationary GPS jitter while parked doesn't spin the compass
+                        val forwardBearing = if (location.hasBearing() && mph >= 2) {
+                            location.bearing
+                        } else {
+                            null
+                        }
+
+                        dashboardView.updateGpsData(mph, forwardBearing)
+                        refreshWeatherIfNeeded(force = false)
                     }
                     @Deprecated("Deprecated in Java")
                     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
                 }
             )
         } catch (_: SecurityException) {}
+    }
+
+    /**
+     * #2: Automatically fetches real-time local outdoor temperature (°F) from Open-Meteo API
+     * using the car's live GPS coordinates (or IP geolocation fallback if GPS isn't locked yet).
+     */
+    fun refreshWeatherIfNeeded(force: Boolean) {
+        val now = System.currentTimeMillis()
+        if (!force && (now - lastWeatherFetchTime) < 15 * 60 * 1000L) return
+        lastWeatherFetchTime = now
+
+        Thread {
+            try {
+                var lat = lastLat
+                var lon = lastLon
+
+                // If GPS hasn't locked onto satellites yet, fall back to Wi-Fi IP coordinates
+                if (lat == null || lon == null) {
+                    val ipConn = URL("https://ipapi.co/json/").openConnection() as HttpURLConnection
+                    ipConn.connectTimeout = 4000
+                    ipConn.readTimeout = 4000
+                    if (ipConn.responseCode == 200) {
+                        val ipJson = JSONObject(BufferedReader(InputStreamReader(ipConn.inputStream)).readText())
+                        if (ipJson.has("latitude") && ipJson.has("longitude")) {
+                            lat = ipJson.getDouble("latitude")
+                            lon = ipJson.getDouble("longitude")
+                        }
+                    }
+                }
+
+                if (lat != null && lon != null) {
+                    val weatherUrl =
+                        "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current_weather=true&temperature_unit=fahrenheit"
+                    val conn = URL(weatherUrl).openConnection() as HttpURLConnection
+                    conn.connectTimeout = 5000
+                    conn.readTimeout = 5000
+                    if (conn.responseCode == 200) {
+                        val response = BufferedReader(InputStreamReader(conn.inputStream)).readText()
+                        val json = JSONObject(response)
+                        val current = json.getJSONObject("current_weather")
+                        val tempF = current.getDouble("temperature").roundToInt()
+                        runOnUiThread {
+                            dashboardView.updateLiveTemperature(tempF)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Keeps last cached temperature if Wi-Fi/hotspot is offline
+            }
+        }.start()
+    }
+
+    /**
+     * #4: Polls XYAuto System Properties, Settings.System, and SharedPreferences for active Radio Frequency
+     * in case the XYAuto Radio app writes frequency to system memory instead of standard broadcasts.
+     */
+    fun pollSystemRadioFrequency(): String {
+        // 1. Check Android Settings.System keys commonly written by XYAuto / Allwinner / MTC firmwares
+        val sysKeys = arrayOf(
+            "radio_freq", "cur_freq", "fm_freq", "xy_radio_freq",
+            " radio_frequency", "RadioFreq", "mcu_radio_freq", "rds_ps"
+        )
+        for (k in sysKeys) {
+            try {
+                val v = Settings.System.getString(contentResolver, k)
+                if (!v.isNullOrBlank()) {
+                    val formatted = formatRadioFrequency(v, "FM")
+                    if (formatted.isNotEmpty()) return formatted
+                }
+                val intVal = Settings.System.getInt(contentResolver, k, -1)
+                if (intVal > 500) {
+                    val formatted = formatRadioFrequency(intVal.toString(), "FM")
+                    if (formatted.isNotEmpty()) return formatted
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 2. Check Android OS SystemProperties (getprop) for MCU radio frequency variables
+        val propKeys = arrayOf(
+            "sys.radio.freq", "persist.sys.radio.freq", "sys.xyauto.radio.freq",
+            "persist.radio.freq", "hw.radio.freq", "sys.fm.freq"
+        )
+        for (prop in propKeys) {
+            try {
+                val proc = Runtime.getRuntime().exec(arrayOf("getprop", prop))
+                val line = BufferedReader(InputStreamReader(proc.inputStream)).readLine()?.trim()
+                if (!line.isNullOrEmpty()) {
+                    val formatted = formatRadioFrequency(line, "FM")
+                    if (formatted.isNotEmpty()) return formatted
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 3. Check if a known Radio package is running in the background
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            @Suppress("DEPRECATION")
+            val procs = am.runningAppProcesses.orEmpty()
+            for (p in procs) {
+                val pkg = p.processName.lowercase()
+                if (pkg.contains("radio") || pkg.contains("fmradio")) {
+                    // Try reading shared preferences of the radio package if accessible
+                    val otherCtx = createPackageContext(p.processName, Context.CONTEXT_IGNORE_SECURITY)
+                    val prefNames = arrayOf("radio", "fmradio", "config", "settings", "${p.processName}_preferences")
+                    for (pf in prefNames) {
+                        val sp = otherCtx.getSharedPreferences(pf, Context.MODE_PRIVATE)
+                        for ((_, value) in sp.all) {
+                            val str = value?.toString().orEmpty()
+                            val formatted = formatRadioFrequency(str, "FM")
+                            if (formatted.isNotEmpty()) return formatted
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        return ""
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -297,19 +481,28 @@ class MainActivity : AppCompatActivity() {
 }
 
 class AgamaDashboardView(
-    context: Context,
+    private val mainActivity: MainActivity,
     private val mediaHelper: MediaControlHelper
-) : View(context) {
+) : View(mainActivity) {
 
     private val prefs: SharedPreferences =
         context.getSharedPreferences("agama_subaru_prefs", Context.MODE_PRIVATE)
     private val audioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    private var primaryColor = prefs.getInt("primary_color_v3", Color.parseColor("#E6192E"))
-    private var secondaryColor = prefs.getInt("secondary_color_v3", Color.parseColor("#4A90E2"))
-    private val bgDark = Color.parseColor("#0D0F14")
-    private val innerRingColor = Color.parseColor("#5E6578")
+    // #1: Area outside the outermost curved dashes is pure Midnight Black (#000000)
+    private val bgMidnightBlack = Color.parseColor("#000000")
+
+    // #5: Legacy Default Installation Theme Colors
+    private val defaultPrimaryRed = Color.parseColor("#E6192E")
+    private val defaultSecondaryBlue = Color.parseColor("#4A90E2")
+    private val defaultInnerRingGray = Color.parseColor("#5E6578")
+    private val defaultWingBaseGray = Color.parseColor("#14171E")
+
+    private var primaryColor = prefs.getInt("primary_color_v3", defaultPrimaryRed)
+    private var secondaryColor = prefs.getInt("secondary_color_v3", defaultSecondaryBlue)
+    private var innerRingColor = prefs.getInt("inner_ring_color_v3", defaultInnerRingGray)
+    private var wingBaseColor = prefs.getInt("wing_base_color_v3", defaultWingBaseGray)
 
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
@@ -318,7 +511,7 @@ class AgamaDashboardView(
 
     // Audio & Radio State Tracking
     private var isMediaBroadcastPlaying = false
-    private var isRadioActive = false
+    private var isRadioActive = prefs.getBoolean("is_radio_active", false)
     private var currentMediaText: String = prefs.getString("last_media_text", "") ?: ""
     private var currentRadioText: String = prefs.getString("last_radio_text", "") ?: ""
     private var scrollXOffset = 0f
@@ -354,9 +547,9 @@ class AgamaDashboardView(
     private val basketballDimpleWingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         shader = createBasketballDimpleShader(
-            Color.parseColor("#14171E"),
-            Color.parseColor("#1F242E"),
-            Color.parseColor("#0B0D12")
+            wingBaseColor,
+             Color.parseColor("#1F242E"),
+            Color.parseColor("#080A0E")
         )
     }
     private val podPressedColor = Color.parseColor("#252A36")
@@ -375,7 +568,7 @@ class AgamaDashboardView(
     private val groovePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 9f
-        color = Color.parseColor("#0D0F14")
+        color = Color.parseColor("#000000")
         strokeCap = Paint.Cap.BUTT
     }
 
@@ -446,13 +639,25 @@ class AgamaDashboardView(
         return BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
     }
 
-    // Continuously checks whether sound is actively playing and scrolls the ticker smoothly
+    private var pollCounter = 0
+
     private val tickerRunnable = object : Runnable {
         override fun run() {
             val systemMusicPlaying = audioManager.isMusicActive
-            // If Android's audio stream is playing music/podcasts, prioritize media over radio
+
+            // Periodically poll system radio properties every ~2 seconds when radio is active
+            pollCounter++
+            if (isRadioActive && pollCounter % 45 == 0) {
+                val polledFreq = mainActivity.pollSystemRadioFrequency()
+                if (polledFreq.isNotEmpty()) {
+                    currentRadioText = polledFreq
+                    prefs.edit().putString("last_radio_text", currentRadioText).apply()
+                }
+            }
+
             if (systemMusicPlaying && isRadioActive && isMediaBroadcastPlaying) {
                 isRadioActive = false
+                prefs.edit().putBoolean("is_radio_active", false).apply()
             }
 
             val shouldScroll = systemMusicPlaying || isMediaBroadcastPlaying || isRadioActive
@@ -471,18 +676,30 @@ class AgamaDashboardView(
         post(tickerRunnable)
     }
 
-    fun syncAudioStateOnResume() {
+    fun syncAudioAndRadioState() {
         if (audioManager.isMusicActive) {
             isMediaBroadcastPlaying = true
+        }
+        val sysFreq = mainActivity.pollSystemRadioFrequency()
+        if (sysFreq.isNotEmpty()) {
+            currentRadioText = sysFreq
+            prefs.edit().putString("last_radio_text", sysFreq).apply()
         }
         invalidate()
     }
 
-    fun updateGpsData(mph: Int, bearing: Float?) {
+    fun updateLiveTemperature(tempF: Int) {
+        temperatureF = tempF
+        prefs.edit().putInt("temp_f", tempF).apply()
+        invalidate()
+    }
+
+    // #3: Updates forward-facing car direction from GPS movement vector
+    fun updateGpsData(mph: Int, forwardBearing: Float?) {
         currentMph = mph
-        if (bearing != null) {
+        if (forwardBearing != null) {
             val dirs = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-            val norm = ((bearing % 360f) + 360f) % 360f
+            val norm = ((forwardBearing % 360f) + 360f) % 360f
             val idx = ((norm + 22.5f) / 45f).toInt() % 8
             compassDir = dirs[idx]
             prefs.edit().putString("last_compass", compassDir).apply()
@@ -490,11 +707,11 @@ class AgamaDashboardView(
         invalidate()
     }
 
-    // Formats Song / Podcast Episode Title, Artist, and Album
     fun updateMediaInfo(track: String, artist: String, album: String, playing: Boolean) {
         isMediaBroadcastPlaying = playing
         if (playing) {
             isRadioActive = false
+            prefs.edit().putBoolean("is_radio_active", false).apply()
         }
 
         val parts = mutableListOf<String>()
@@ -511,9 +728,9 @@ class AgamaDashboardView(
         invalidate()
     }
 
-    // Formats Radio Station Number, Call Letters, and Station Type
     fun updateRadioInfo(stationText: String, active: Boolean) {
         isRadioActive = active
+        prefs.edit().putBoolean("is_radio_active", active).apply()
         if (active) {
             isMediaBroadcastPlaying = false
         }
@@ -526,6 +743,7 @@ class AgamaDashboardView(
 
     fun setRadioInactive() {
         isRadioActive = false
+        prefs.edit().putBoolean("is_radio_active", false).apply()
         invalidate()
     }
 
@@ -555,7 +773,8 @@ class AgamaDashboardView(
         val cx = w / 2f
         val cy = h / 2f
 
-        canvas.drawColor(bgDark)
+        // #1: Entire screen outside the outermost curved dashes is pure Midnight Black (#000000)
+        canvas.drawColor(bgMidnightBlack)
 
         val rHub = h * 0.29f
         val rInner = h * 0.465f
@@ -714,11 +933,9 @@ class AgamaDashboardView(
         drawRedOutlinedText(canvas, "-", cx + rMid * cos(volAngleLeft).toFloat(), cy + rMid * sin(volAngleLeft).toFloat() + 14f, h * 0.054f)
         drawRedOutlinedText(canvas, "+", cx + rMid * cos(volAngleRight).toFloat(), cy + rMid * sin(volAngleRight).toFloat() + 14f, h * 0.054f)
 
-        // Bottom Arc Header
         val bottomHeader = if (isRadioActive && !audioManager.isMusicActive) "Radio Tuner" else "Music Player"
         drawRedOutlinedText(canvas, bottomHeader, cx, cy + rMid - h * 0.006f, h * 0.031f)
 
-        // Bottom Scrolling Ticker (Blank when nothing is playing; scrolls Radio or Media info when active)
         drawBottomMediaAndRadioTicker(canvas, cx, cy + rMid + h * 0.036f, rHub * 0.64f, h * 0.028f)
 
         val mediaAngleLeft = Math.toRadians(118.0)
@@ -736,16 +953,12 @@ class AgamaDashboardView(
         drawCustomSlotIcon(canvas, "APPS", 5, cx + rMid * 0.92f, h * 0.71f, iconSize)
     }
 
-    /**
-     * Strictly displays scrolling text ONLY when the Radio or a Media/Podcast app is actively playing.
-     * Shows nothing at all (no "Play" button text) when silent.
-     */
     private fun drawBottomMediaAndRadioTicker(canvas: Canvas, cx: Float, y: Float, halfWidth: Float, textSize: Float) {
         val systemMusicActive = audioManager.isMusicActive
         val mediaPlaying = systemMusicActive || isMediaBroadcastPlaying
         val radioPlaying = isRadioActive && !systemMusicActive
 
-        // If neither the radio nor any audio app is playing sound, draw nothing at all
+        // Strictly blank when neither radio nor any media app is playing
         if (!mediaPlaying && !radioPlaying) {
             return
         }
@@ -795,7 +1008,7 @@ class AgamaDashboardView(
     }
 
     private fun drawCentralHub(canvas: Canvas, cx: Float, cy: Float, rHub: Float) {
-        fillPaint.color = Color.parseColor("#040507")
+        fillPaint.color = Color.parseColor("#000000")
         canvas.drawCircle(cx, cy, rHub + 7f, fillPaint)
 
         canvas.drawCircle(cx, cy, rHub, basketballDimpleCenterPaint)
@@ -1227,13 +1440,17 @@ class AgamaDashboardView(
             "MEDIA_PREV" -> mediaHelper.prevTrack()
             "MEDIA_NEXT" -> mediaHelper.nextTrack()
 
-            // Bottom-center area is strictly a read-only display (does NOT play/pause audio)
-            "MEDIA_INFO_DISPLAY" -> {
-                // Intentionally does not dispatch play/pause so music or radio is never interrupted
-            }
+            // Strictly read-only display so audio/radio is never paused on tap
+            "MEDIA_INFO_DISPLAY" -> {}
 
             "CLOCK_TOP_LEFT" -> openRecentApps()
-            "TEMP_TOP_RIGHT" -> showTemperatureDialog()
+
+            // #2: Tapping temperature triggers an immediate live GPS weather refresh (no manual popup)
+            "TEMP_TOP_RIGHT" -> {
+                Toast.makeText(context, "Refreshing live outdoor temperature...", Toast.LENGTH_SHORT).show()
+                mainActivity.refreshWeatherIfNeeded(force = true)
+            }
+
             "WIFI_BOTTOM_LEFT" -> {
                 try {
                     context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -1249,14 +1466,7 @@ class AgamaDashboardView(
                 } else if (slotKey == "APPS") {
                     showVisualAppDrawer(assignToSlot = null)
                 } else {
-                    if (slotKey == "RADIO") {
-                        isRadioActive = true
-                        isMediaBroadcastPlaying = false
-                        invalidate()
-                    } else if (slotKey == "MUSIC" || slotKey == "CARPLAY") {
-                        isRadioActive = false
-                        invalidate()
-                    }
+                    handleSlotAudioModeSwitch(slotKey)
                     launchAssignedApp(slotKey)
                 }
             }
@@ -1268,20 +1478,33 @@ class AgamaDashboardView(
                 } else if (slotKey == "APPS") {
                     showVisualAppDrawer(assignToSlot = null)
                 } else {
-                    if (slotKey == "RADIO") {
-                        isRadioActive = true
-                        isMediaBroadcastPlaying = false
-                        invalidate()
-                    } else if (slotKey == "MUSIC" || slotKey == "CARPLAY") {
-                        isRadioActive = false
-                        invalidate()
-                    }
+                    handleSlotAudioModeSwitch(slotKey)
                     launchAssignedApp(slotKey)
                 }
             }
 
             "GEAR_SKIN" -> showSkinCustomizerDialog()
             "GEAR_HOME" -> showEscapeHatchDialog()
+        }
+    }
+
+    private fun handleSlotAudioModeSwitch(slotKey: String) {
+        if (slotKey == "RADIO") {
+            isRadioActive = true
+            isMediaBroadcastPlaying = false
+            prefs.edit().putBoolean("is_radio_active", true).apply()
+            val polled = mainActivity.pollSystemRadioFrequency()
+            if (polled.isNotEmpty()) {
+                currentRadioText = polled
+                prefs.edit().putString("last_radio_text", polled).apply()
+            } else if (currentRadioText.isBlank()) {
+                currentRadioText = "FM Radio Tuner Active"
+            }
+            invalidate()
+        } else if (slotKey == "MUSIC" || slotKey == "CARPLAY") {
+            isRadioActive = false
+            prefs.edit().putBoolean("is_radio_active", false).apply()
+            invalidate()
         }
     }
 
@@ -1497,31 +1720,10 @@ class AgamaDashboardView(
         showVisualAppDrawer(assignToSlot = slotKey)
     }
 
-    private fun showTemperatureDialog() {
-        val input = EditText(context).apply {
-            setText(temperatureF.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
-            setSelection(text.length)
-            setPadding(45, 35, 45, 35)
-        }
-        AlertDialog.Builder(context)
-            .setTitle("Set Temperature Readout (°F)")
-            .setView(input)
-            .setPositiveButton("Update") { _, _ ->
-                val v = input.text.toString().toIntOrNull()
-                if (v != null) {
-                    temperatureF = v
-                    prefs.edit().putInt("temp_f", v).apply()
-                    invalidate()
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
+    // #5: Added "Legacy Default (Original Installation Theme)" at the top of the Theme Picker
     private fun showSkinCustomizerDialog() {
         val themes = arrayOf(
-            "Pure Crimson Red & Blue (Default)",
+            "Legacy Default (Original Installation Theme)",
             "Deep Ruby Red & Blue",
             "Subaru World Rally Blue & Gold",
             "Subaru Wilderness Gold & Blue",
@@ -1529,10 +1731,10 @@ class AgamaDashboardView(
             "Emerald Matrix Green"
         )
         AlertDialog.Builder(context)
-            .setTitle("Customize Launcher Skin Color")
+            .setTitle("Customize Launcher Theme")
             .setItems(themes) { _, which ->
                 val (pri, sec) = when (which) {
-                    0 -> Color.parseColor("#E6192E") to Color.parseColor("#4A90E2")
+                    0 -> defaultPrimaryRed to defaultSecondaryBlue
                     1 -> Color.parseColor("#C8102E") to Color.parseColor("#4A90E2")
                     2 -> Color.parseColor("#2B7DE9") to Color.parseColor("#E5B842")
                     3 -> Color.parseColor("#E09F24") to Color.parseColor("#4A90E2")
@@ -1541,9 +1743,14 @@ class AgamaDashboardView(
                 }
                 primaryColor = pri
                 secondaryColor = sec
+                innerRingColor = defaultInnerRingGray
+                wingBaseColor = defaultWingBaseGray
+
                 prefs.edit()
                     .putInt("primary_color_v3", pri)
                     .putInt("secondary_color_v3", sec)
+                    .putInt("inner_ring_color_v3", innerRingColor)
+                    .putInt("wing_base_color_v3", wingBaseColor)
                     .apply()
                 invalidate()
             }
@@ -1555,6 +1762,7 @@ class AgamaDashboardView(
         val options = arrayOf(
             "Switch / Revert to Stock XYAuto Launcher",
             "Open Android System Settings",
+            "Radio Broadcast Sniffer (Diagnostics)",
             "Reset All Custom Labels, Icons & Shortcuts"
         )
         AlertDialog.Builder(context)
@@ -1563,7 +1771,8 @@ class AgamaDashboardView(
                 when (which) {
                     0 -> LauncherUtils.openHomeSettings(context)
                     1 -> context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    2 -> {
+                    2 -> showRadioDiagnosticDialog()
+                    3 -> {
                         for (k in wingKeys) {
                             prefs.edit()
                                 .remove("pkg_$k")
@@ -1571,12 +1780,39 @@ class AgamaDashboardView(
                                 .remove("icon_$k")
                                 .apply()
                         }
+                        primaryColor = defaultPrimaryRed
+                        secondaryColor = defaultSecondaryBlue
+                        innerRingColor = defaultInnerRingGray
+                        wingBaseColor = defaultWingBaseGray
+                        prefs.edit()
+                            .putInt("primary_color_v3", defaultPrimaryRed)
+                            .putInt("secondary_color_v3", defaultSecondaryBlue)
+                            .apply()
                         invalidate()
-                        Toast.makeText(context, "All customizations reset", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "All customizations reset to Legacy Default", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
             .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showRadioDiagnosticDialog() {
+        val polled = mainActivity.pollSystemRadioFrequency().ifEmpty { "None detected in getprop/Settings" }
+        val logs = if (mainActivity.recentBroadcastLog.isEmpty()) {
+            "No media/radio broadcasts captured yet."
+        } else {
+            mainActivity.recentBroadcastLog.joinToString("\n\n")
+        }
+
+        val message = "Polled System Frequency: $polled\n" +
+                "Active Radio Text: ${currentRadioText.ifEmpty { "Empty" }}\n\n" +
+                "Recent Broadcasts:\n$logs"
+
+        AlertDialog.Builder(context)
+            .setTitle("Radio Broadcast Sniffer")
+            .setMessage(message)
+            .setPositiveButton("Close", null)
             .show()
     }
 }
