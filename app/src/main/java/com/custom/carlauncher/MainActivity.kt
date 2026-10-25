@@ -38,74 +38,146 @@ class MainActivity : AppCompatActivity() {
     private lateinit var locationManager: LocationManager
     private lateinit var dashboardView: AgamaDashboardView
 
-    // Captures both Music Player metadata and XYAuto / Android FM Radio station broadcasts
+    // Comprehensive receiver for Music, Podcasts, and XYAuto/MCU FM/AM Radio broadcasts
     private val mediaAndRadioReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent == null) return
             val action = intent.action.orEmpty()
+            val bundle = intent.extras
 
-            if (action.contains("radio", ignoreCase = true) ||
-                action.contains("fm", ignoreCase = true) ||
-                intent.hasExtra("freq") ||
-                intent.hasExtra("frequency") ||
-                intent.hasExtra("radio_freq")
+            // 1. Check if the broadcast is a Radio power-off / stop signal
+            if (action.contains("radio", ignoreCase = true) &&
+                (action.contains("stop", ignoreCase = true) ||
+                        action.contains("close", ignoreCase = true) ||
+                        action.contains("exit", ignoreCase = true) ||
+                        intent.getBooleanExtra("playing", true) == false ||
+                        intent.getIntExtra("state", 1) == 0)
             ) {
-                val stationName = intent.getStringExtra("ps")
-                    ?: intent.getStringExtra("rds")
-                    ?: intent.getStringExtra("rt")
-                    ?: intent.getStringExtra("station")
-                    ?: intent.getStringExtra("radio_name")
-                    ?: intent.getStringExtra("name")
-                    ?: intent.getStringExtra("title")
-
-                val rawFreq = intent.extras?.get("freq")?.toString()
-                    ?: intent.extras?.get("frequency")?.toString()
-                    ?: intent.extras?.get("radio_freq")?.toString()
-                    ?: intent.extras?.get("channel")?.toString()
-
-                val band = intent.getStringExtra("band") ?: "FM"
-                val formattedFreq = formatRadioFrequency(rawFreq, band)
-
-                // Clean radio frequency display (e.g., 92.3 FM)
-                val combinedRadioText = when {
-                    !stationName.isNullOrBlank() && formattedFreq.isNotEmpty() -> "$formattedFreq — $stationName"
-                    formattedFreq.isNotEmpty() -> formattedFreq
-                    !stationName.isNullOrBlank() -> stationName
-                    else -> "92.3 FM"
-                }
-
-                val isRadioPlaying = intent.getBooleanExtra("playing", true) &&
-                        !action.contains("stop", ignoreCase = true) &&
-                        !action.contains("close", ignoreCase = true)
-
-                dashboardView.updateRadioInfo(combinedRadioText, isRadioPlaying)
+                dashboardView.setRadioInactive()
                 return
             }
 
-            val track = intent.getStringExtra("track")
-                ?: intent.getStringExtra("title")
-                ?: intent.getStringExtra("music_title")
-            val artist = intent.getStringExtra("artist")
-                ?: intent.getStringExtra("author")
-                ?: intent.getStringExtra("music_artist")
-            val playing = when {
-                intent.hasExtra("playing") -> intent.getBooleanExtra("playing", true)
-                intent.hasExtra("playstate") -> intent.getBooleanExtra("playstate", true)
+            // 2. Check if broadcast is from the Head Unit's FM/AM Radio app or MCU
+            val isRadioIntent = action.contains("radio", ignoreCase = true) ||
+                    action.contains("fm", ignoreCase = true) ||
+                    intent.hasExtra("freq") ||
+                    intent.hasExtra("frequency") ||
+                    intent.hasExtra("radio_freq") ||
+                    intent.hasExtra("cur_freq") ||
+                    intent.hasExtra("channel_freq")
+
+            if (isRadioIntent) {
+                val rawFreq = extractFirstString(
+                    bundle,
+                    "freq", "frequency", "radio_freq", "cur_freq", "channel_freq", "channel", "fm_freq"
+                )
+                val band = extractFirstString(bundle, "band", "radio_band", "wave", "type_band")
+                    .ifEmpty { "FM" }
+                val callLetters = extractFirstString(
+                    bundle,
+                    "ps", "rds_ps", "call", "station", "radio_name", "station_name", "channel_name", "name"
+                )
+                val stationType = extractFirstString(
+                    bundle,
+                    "pty", "rds_pty", "genre", "program_type", "station_type", "tp"
+                )
+                val radioText = extractFirstString(
+                    bundle,
+                    "rt", "rds_rt", "rds", "radio_text", "infor", "info", "text", "title"
+                )
+
+                val formattedFreq = formatRadioFrequency(rawFreq, band)
+
+                // Assemble Station Number, Call Letters, and Station Type / RDS Info
+                val parts = mutableListOf<String>()
+                if (formattedFreq.isNotEmpty()) parts.add(formattedFreq)
+                if (callLetters.isNotEmpty() && !callLetters.equals(formattedFreq, ignoreCase = true)) {
+                    parts.add(callLetters)
+                }
+                if (stationType.isNotEmpty() && !parts.contains(stationType)) {
+                    parts.add(stationType)
+                }
+                if (radioText.isNotEmpty() && !parts.contains(radioText)) {
+                    parts.add(radioText)
+                }
+
+                // Fallback: scan any other string/number extras if standard keys were empty
+                if (parts.isEmpty() && bundle != null) {
+                    for (key in bundle.keySet()) {
+                        val v = bundle.get(key)?.toString()?.trim().orEmpty()
+                        if (v.isNotEmpty() && v != "true" && v != "false") {
+                            val maybeFreq = formatRadioFrequency(v, band)
+                            parts.add(maybeFreq.ifEmpty { v })
+                        }
+                    }
+                }
+
+                val fullRadioString = parts.joinToString("  •  ")
+                dashboardView.updateRadioInfo(fullRadioString, true)
+                return
+            }
+
+            // 3. Otherwise process as Music / Podcast / Media App Metadata
+            val track = extractFirstString(
+                bundle,
+                "track", "title", "music_title", "song", "episode", "name", "android.media.metadata.TITLE"
+            )
+            val artist = extractFirstString(
+                bundle,
+                "artist", "author", "music_artist", "writer", "podcast", "show", "android.media.metadata.ARTIST"
+            )
+            val album = extractFirstString(
+                bundle,
+                "album", "music_album", "series", "station", "android.media.metadata.ALBUM"
+            )
+
+            val isPlaying = when {
+                action.contains("playbackcomplete", ignoreCase = true) -> false
+                action.contains("pause", ignoreCase = true) -> false
+                bundle?.containsKey("playing") == true -> bundle.getBoolean("playing", true)
+                bundle?.containsKey("playstate") == true -> {
+                    val st = bundle.get("playstate")
+                    when (st) {
+                        is Boolean -> st
+                        is Int -> st == 1 || st == 3
+                        else -> true
+                    }
+                }
+                bundle?.containsKey("isPlaying") == true -> bundle.getBoolean("isPlaying", true)
                 else -> true
             }
-            dashboardView.updateMediaInfo(artist, track, playing)
+
+            dashboardView.updateMediaInfo(track, artist, album, isPlaying)
         }
     }
 
+    private fun extractFirstString(bundle: Bundle?, vararg keys: String): String {
+        if (bundle == null) return ""
+        for (k in keys) {
+            for (actualKey in bundle.keySet()) {
+                if (actualKey.equals(k, ignoreCase = true)) {
+                    val v = bundle.get(actualKey)?.toString()?.trim().orEmpty()
+                    if (v.isNotEmpty() && v != "null") return v
+                }
+            }
+        }
+        return ""
+    }
+
     private fun formatRadioFrequency(raw: String?, band: String): String {
-        if (raw.isNullOrBlank()) return "92.3 $band"
-        val num = raw.toDoubleOrNull() ?: return "$raw $band"
+        if (raw.isNullOrBlank()) return ""
+        val clean = raw.replace("MHz", "", ignoreCase = true)
+            .replace("kHz", "", ignoreCase = true)
+            .replace("FM", "", ignoreCase = true)
+            .replace("AM", "", ignoreCase = true)
+            .trim()
+        val num = clean.toDoubleOrNull() ?: return "$raw $band".trim()
         return when {
-            num in 8700.0..10850.0 -> String.format(Locale.US, "%.1f %s", num / 100.0, band)
-            num in 87000.0..108500.0 -> String.format(Locale.US, "%.1f %s", num / 1000.0, band)
-            num in 87.0..108.5 -> String.format(Locale.US, "%.1f %s", num, band)
+            num in 8700.0..10850.0 -> String.format(Locale.US, "%.1f %s", num / 100.0, band.ifEmpty { "FM" })
+            num in 87000.0..108500.0 -> String.format(Locale.US, "%.1f %s", num / 1000.0, band.ifEmpty { "FM" })
+            num in 87.0..108.5 -> String.format(Locale.US, "%.1f %s", num, band.ifEmpty { "FM" })
             num in 500.0..1750.0 -> String.format(Locale.US, "%.0f AM", num)
-            else -> "$raw $band"
+            else -> "$raw $band".trim()
         }
     }
 
@@ -122,11 +194,19 @@ class MainActivity : AppCompatActivity() {
         startGpsUpdates()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Refresh active audio state immediately whenever returning to the home screen
+        dashboardView.syncAudioStateOnResume()
+    }
+
     private fun registerMediaAndRadioBroadcasts() {
         val filter = IntentFilter().apply {
+            // Standard Android, Music, and Podcast Player Broadcasts
             addAction("com.android.music.metachanged")
             addAction("com.android.music.playstatechanged")
             addAction("com.android.music.playbackcomplete")
+            addAction("com.android.music.queuechanged")
             addAction("com.spotify.music.metadatachanged")
             addAction("com.spotify.music.playbackstatechanged")
             addAction("com.maxmpz.audioplayer.TRACK_CHANGED")
@@ -136,18 +216,31 @@ class MainActivity : AppCompatActivity() {
             addAction("com.nullsoft.winamp.metachanged")
             addAction("com.miui.player.metachanged")
             addAction("com.andrew.apollo.metachanged")
-            addAction("com.microntek.music.toast")
-            addAction("com.xyauto.music.metachanged")
+            addAction("com.sec.android.app.music.metachanged")
+            addAction("org.videolan.vlc.player.result")
+            addAction("in.krosbits.musicolet.metachanged")
+            addAction("in.krosbits.musicolet.playstatechanged")
+            addAction("com.bambuna.podcastaddict.service.player.update")
+            addAction("de.danoeh.antennapod.intent.PLAYBACK_STATUS")
 
+            // XYAuto / FYT / Microntek / Head Unit Music & Radio MCU Broadcasts
+            addAction("com.microntek.music.toast")
+            addAction("com.microntek.music.report")
+            addAction("com.xyauto.music.metachanged")
+            addAction("com.xyauto.broadcast.MUSIC_INFO")
             addAction("com.xyauto.broadcast.RADIO_INFO")
             addAction("com.xyauto.radio.metachanged")
             addAction("com.xyauto.broadcast.radio")
+            addAction("com.xyauto.action.RADIO_INFO")
             addAction("com.microntek.radio.report")
             addAction("com.android.fmradio.metachanged")
+            addAction("com.caf.fmradio.FMRADIO_STATE_CHANGED")
             addAction("com.fyt.radio")
+            addAction("com.syu.ms.radio")
             addAction("com.hcn.radio.info")
             addAction("com.glsx.boot.AC_RADIO_INFO")
             addAction("cn.abel.action.broadcast")
+            addAction("com.ts.main.radio.info")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(mediaAndRadioReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -188,7 +281,6 @@ class MainActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_MEDIA_PAUSE,
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                 mediaHelper.playPause()
-                dashboardView.togglePlayState()
                 true
             }
             KeyEvent.KEYCODE_MEDIA_NEXT -> {
@@ -218,16 +310,17 @@ class AgamaDashboardView(
     private var secondaryColor = prefs.getInt("secondary_color_v3", Color.parseColor("#4A90E2"))
     private val bgDark = Color.parseColor("#0D0F14")
     private val innerRingColor = Color.parseColor("#5E6578")
-    private val hubBgColor = Color.parseColor("#08090C")
 
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
     private var temperatureF = prefs.getInt("temp_f", 59)
-    private var isPlayingState = false
-    private var isRadioMode = false
-    private var currentSongInfo: String = ""
-    private var currentRadioInfo: String = prefs.getString("last_radio_station", "92.3 FM") ?: "92.3 FM"
+
+    // Audio & Radio State Tracking
+    private var isMediaBroadcastPlaying = false
+    private var isRadioActive = false
+    private var currentMediaText: String = prefs.getString("last_media_text", "") ?: ""
+    private var currentRadioText: String = prefs.getString("last_radio_text", "") ?: ""
     private var scrollXOffset = 0f
     private var pressedZone: String? = null
 
@@ -250,15 +343,21 @@ class AgamaDashboardView(
 
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
-    // Basketball Dimpled Texture Paint (Used for both Center Hub and Outer Text Wings)
     private val basketballDimpleCenterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        shader = createBasketballDimpleShader(Color.parseColor("#08090C"), Color.parseColor("#181B22"), Color.parseColor("#030405"))
+        shader = createBasketballDimpleShader(
+            Color.parseColor("#08090C"),
+            Color.parseColor("#181B22"),
+            Color.parseColor("#030405")
+        )
     }
     private val basketballDimpleWingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        // 20% darker shade of gray texture for outer wings (#14171E)
-        shader = createBasketballDimpleShader(Color.parseColor("#14171E"), Color.parseColor("#1F242E"), Color.parseColor("#0B0D12"))
+        shader = createBasketballDimpleShader(
+            Color.parseColor("#14171E"),
+            Color.parseColor("#1F242E"),
+            Color.parseColor("#0B0D12")
+        )
     }
     private val podPressedColor = Color.parseColor("#252A36")
 
@@ -347,22 +446,36 @@ class AgamaDashboardView(
         return BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
     }
 
+    // Continuously checks whether sound is actively playing and scrolls the ticker smoothly
     private val tickerRunnable = object : Runnable {
         override fun run() {
-            val activeStream = audioManager.isMusicActive || isPlayingState || isRadioMode
-            if (activeStream) {
-                scrollXOffset += 3.2f
+            val systemMusicPlaying = audioManager.isMusicActive
+            // If Android's audio stream is playing music/podcasts, prioritize media over radio
+            if (systemMusicPlaying && isRadioActive && isMediaBroadcastPlaying) {
+                isRadioActive = false
+            }
+
+            val shouldScroll = systemMusicPlaying || isMediaBroadcastPlaying || isRadioActive
+            if (shouldScroll) {
+                scrollXOffset += 3.0f
                 invalidate()
                 postDelayed(this, 40L)
             } else {
                 invalidate()
-                postDelayed(this, 5000L)
+                postDelayed(this, 1000L)
             }
         }
     }
 
     init {
         post(tickerRunnable)
+    }
+
+    fun syncAudioStateOnResume() {
+        if (audioManager.isMusicActive) {
+            isMediaBroadcastPlaying = true
+        }
+        invalidate()
     }
 
     fun updateGpsData(mph: Int, bearing: Float?) {
@@ -377,33 +490,42 @@ class AgamaDashboardView(
         invalidate()
     }
 
-    fun updateMediaInfo(artist: String?, track: String?, playing: Boolean) {
-        isPlayingState = playing
-        if (playing) isRadioMode = false
-        val cleanTrack = track?.trim().orEmpty()
-        val cleanArtist = artist?.trim().orEmpty()
-        if (cleanTrack.isNotEmpty() || cleanArtist.isNotEmpty()) {
-            currentSongInfo = if (cleanArtist.isNotEmpty() && cleanTrack.isNotEmpty()) {
-                "$cleanArtist — $cleanTrack"
-            } else {
-                cleanTrack.ifEmpty { cleanArtist }
-            }
+    // Formats Song / Podcast Episode Title, Artist, and Album
+    fun updateMediaInfo(track: String, artist: String, album: String, playing: Boolean) {
+        isMediaBroadcastPlaying = playing
+        if (playing) {
+            isRadioActive = false
+        }
+
+        val parts = mutableListOf<String>()
+        if (track.isNotEmpty()) parts.add(track)
+        if (artist.isNotEmpty() && !artist.equals("<unknown>", ignoreCase = true)) parts.add(artist)
+        if (album.isNotEmpty() && !album.equals("<unknown>", ignoreCase = true) && !album.equals(track, ignoreCase = true)) {
+            parts.add(album)
+        }
+
+        if (parts.isNotEmpty()) {
+            currentMediaText = parts.joinToString("  —  ")
+            prefs.edit().putString("last_media_text", currentMediaText).apply()
         }
         invalidate()
     }
 
-    fun updateRadioInfo(stationText: String, playing: Boolean) {
-        isRadioMode = playing
-        isPlayingState = playing
+    // Formats Radio Station Number, Call Letters, and Station Type
+    fun updateRadioInfo(stationText: String, active: Boolean) {
+        isRadioActive = active
+        if (active) {
+            isMediaBroadcastPlaying = false
+        }
         if (stationText.isNotBlank()) {
-            currentRadioInfo = stationText.trim()
-            prefs.edit().putString("last_radio_station", currentRadioInfo).apply()
+            currentRadioText = stationText.trim()
+            prefs.edit().putString("last_radio_text", currentRadioText).apply()
         }
         invalidate()
     }
 
-    fun togglePlayState() {
-        isPlayingState = !isPlayingState
+    fun setRadioInactive() {
+        isRadioActive = false
         invalidate()
     }
 
@@ -456,7 +578,6 @@ class AgamaDashboardView(
         ryOuter: Float
     ) {
         val wingRect = RectF(cx - rxOuter, cy - ryOuter, cx + rxOuter, cy + ryOuter)
-        // #1: Outer text wings filled with the 20% darker dimpled basketball texture
         canvas.drawOval(wingRect, basketballDimpleWingPaint)
 
         val y1 = h * 0.19f
@@ -593,10 +714,12 @@ class AgamaDashboardView(
         drawRedOutlinedText(canvas, "-", cx + rMid * cos(volAngleLeft).toFloat(), cy + rMid * sin(volAngleLeft).toFloat() + 14f, h * 0.054f)
         drawRedOutlinedText(canvas, "+", cx + rMid * cos(volAngleRight).toFloat(), cy + rMid * sin(volAngleRight).toFloat() + 14f, h * 0.054f)
 
-        val bottomHeader = if (isRadioMode) "RadioTuner" else "Music Player"
+        // Bottom Arc Header
+        val bottomHeader = if (isRadioActive && !audioManager.isMusicActive) "Radio Tuner" else "Music Player"
         drawRedOutlinedText(canvas, bottomHeader, cx, cy + rMid - h * 0.006f, h * 0.031f)
 
-        drawBottomMediaAndRadioSubtext(canvas, cx, cy + rMid + h * 0.036f, rHub * 0.62f, h * 0.028f)
+        // Bottom Scrolling Ticker (Blank when nothing is playing; scrolls Radio or Media info when active)
+        drawBottomMediaAndRadioTicker(canvas, cx, cy + rMid + h * 0.036f, rHub * 0.64f, h * 0.028f)
 
         val mediaAngleLeft = Math.toRadians(118.0)
         val mediaAngleRight = Math.toRadians(62.0)
@@ -613,33 +736,37 @@ class AgamaDashboardView(
         drawCustomSlotIcon(canvas, "APPS", 5, cx + rMid * 0.92f, h * 0.71f, iconSize)
     }
 
-    private fun drawBottomMediaAndRadioSubtext(canvas: Canvas, cx: Float, y: Float, halfWidth: Float, textSize: Float) {
+    /**
+     * Strictly displays scrolling text ONLY when the Radio or a Media/Podcast app is actively playing.
+     * Shows nothing at all (no "Play" button text) when silent.
+     */
+    private fun drawBottomMediaAndRadioTicker(canvas: Canvas, cx: Float, y: Float, halfWidth: Float, textSize: Float) {
+        val systemMusicActive = audioManager.isMusicActive
+        val mediaPlaying = systemMusicActive || isMediaBroadcastPlaying
+        val radioPlaying = isRadioActive && !systemMusicActive
+
+        // If neither the radio nor any audio app is playing sound, draw nothing at all
+        if (!mediaPlaying && !radioPlaying) {
+            return
+        }
+
+        val displayString = when {
+            radioPlaying -> currentRadioText
+            mediaPlaying -> currentMediaText
+            else -> ""
+        }
+
+        if (displayString.isBlank()) return
+
         textPaint.textSize = textSize
         textPaint.color = secondaryColor
 
-        val active = audioManager.isMusicActive || isPlayingState || isRadioMode
-        if (!active) {
-            canvas.drawText("Play", cx, y, textPaint)
-            return
-        }
-
-        // #2: Displays station numbers (e.g. 92.3 FM) when radio is active
-        val rawInfo = when {
-            isRadioMode && currentRadioInfo.isNotEmpty() -> currentRadioInfo
-            currentSongInfo.isNotEmpty() -> currentSongInfo
-            isRadioMode -> "92.3 FM"
-            else -> "Playing Audio Stream"
-        }
-
-        val tickerText = "$rawInfo     •     "
+        val tickerText = "$displayString       •       "
         val textWidth = textPaint.measureText(tickerText)
-        if (textWidth <= 0f) {
-            canvas.drawText("92.3 FM", cx, y, textPaint)
-            return
-        }
+        if (textWidth <= 0f) return
 
         canvas.save()
-        canvas.clipRect(cx - halfWidth, y - textSize * 1.2f, cx + halfWidth, y + textSize * 0.4f)
+        canvas.clipRect(cx - halfWidth, y - textSize * 1.25f, cx + halfWidth, y + textSize * 0.45f)
         textPaint.textAlign = Paint.Align.LEFT
         val offset = scrollXOffset % textWidth
         val startX = (cx - halfWidth) - offset
@@ -1044,7 +1171,7 @@ class AgamaDashboardView(
                     when {
                         dx < -rHub * 0.35f -> "MEDIA_PREV"
                         dx > rHub * 0.35f -> "MEDIA_NEXT"
-                        else -> "MEDIA_PLAY"
+                        else -> "MEDIA_INFO_DISPLAY"
                     }
                 }
                 dx < 0 -> {
@@ -1099,14 +1226,12 @@ class AgamaDashboardView(
             )
             "MEDIA_PREV" -> mediaHelper.prevTrack()
             "MEDIA_NEXT" -> mediaHelper.nextTrack()
-            "MEDIA_PLAY" -> {
-                if (isLongPress) {
-                    showRadioStationTextDialog()
-                } else {
-                    mediaHelper.playPause()
-                    togglePlayState()
-                }
+
+            // Bottom-center area is strictly a read-only display (does NOT play/pause audio)
+            "MEDIA_INFO_DISPLAY" -> {
+                // Intentionally does not dispatch play/pause so music or radio is never interrupted
             }
+
             "CLOCK_TOP_LEFT" -> openRecentApps()
             "TEMP_TOP_RIGHT" -> showTemperatureDialog()
             "WIFI_BOTTOM_LEFT" -> {
@@ -1125,11 +1250,11 @@ class AgamaDashboardView(
                     showVisualAppDrawer(assignToSlot = null)
                 } else {
                     if (slotKey == "RADIO") {
-                        isRadioMode = true
-                        isPlayingState = true
+                        isRadioActive = true
+                        isMediaBroadcastPlaying = false
                         invalidate()
-                    } else if (slotKey == "MUSIC") {
-                        isRadioMode = false
+                    } else if (slotKey == "MUSIC" || slotKey == "CARPLAY") {
+                        isRadioActive = false
                         invalidate()
                     }
                     launchAssignedApp(slotKey)
@@ -1144,11 +1269,11 @@ class AgamaDashboardView(
                     showVisualAppDrawer(assignToSlot = null)
                 } else {
                     if (slotKey == "RADIO") {
-                        isRadioMode = true
-                        isPlayingState = true
+                        isRadioActive = true
+                        isMediaBroadcastPlaying = false
                         invalidate()
-                    } else if (slotKey == "MUSIC") {
-                        isRadioMode = false
+                    } else if (slotKey == "MUSIC" || slotKey == "CARPLAY") {
+                        isRadioActive = false
                         invalidate()
                     }
                     launchAssignedApp(slotKey)
@@ -1158,29 +1283,6 @@ class AgamaDashboardView(
             "GEAR_SKIN" -> showSkinCustomizerDialog()
             "GEAR_HOME" -> showEscapeHatchDialog()
         }
-    }
-
-    private fun showRadioStationTextDialog() {
-        val input = EditText(context).apply {
-            setText(currentRadioInfo)
-            inputType = InputType.TYPE_CLASS_TEXT
-            setSelection(text.length)
-            setPadding(45, 35, 45, 35)
-        }
-        AlertDialog.Builder(context)
-            .setTitle("Radio Station / Frequency")
-            .setMessage("Set custom station frequency (e.g., 92.3 FM):")
-            .setView(input)
-            .setPositiveButton("Set Radio Mode") { _, _ ->
-                val text = input.text.toString().trim().ifEmpty { "92.3 FM" }
-                updateRadioInfo(text, true)
-            }
-            .setNeutralButton("Switch to Music") { _, _ ->
-                isRadioMode = false
-                invalidate()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
     }
 
     private fun openRecentApps() {
