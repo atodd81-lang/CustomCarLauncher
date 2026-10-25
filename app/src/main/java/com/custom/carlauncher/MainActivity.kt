@@ -44,7 +44,6 @@ class MainActivity : AppCompatActivity() {
             if (intent == null) return
             val action = intent.action.orEmpty()
 
-            // 1. Check if broadcast is from the Head Unit's FM/AM Radio
             if (action.contains("radio", ignoreCase = true) ||
                 action.contains("fm", ignoreCase = true) ||
                 intent.hasExtra("freq") ||
@@ -67,11 +66,12 @@ class MainActivity : AppCompatActivity() {
                 val band = intent.getStringExtra("band") ?: "FM"
                 val formattedFreq = formatRadioFrequency(rawFreq, band)
 
+                // Clean radio frequency display (e.g., 92.3 FM)
                 val combinedRadioText = when {
                     !stationName.isNullOrBlank() && formattedFreq.isNotEmpty() -> "$formattedFreq — $stationName"
-                    !stationName.isNullOrBlank() -> stationName
                     formattedFreq.isNotEmpty() -> formattedFreq
-                    else -> "FM/AM Radio Active"
+                    !stationName.isNullOrBlank() -> stationName
+                    else -> "92.3 FM"
                 }
 
                 val isRadioPlaying = intent.getBooleanExtra("playing", true) &&
@@ -82,7 +82,6 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            // 2. Otherwise process as Music / Media Stream Metadata
             val track = intent.getStringExtra("track")
                 ?: intent.getStringExtra("title")
                 ?: intent.getStringExtra("music_title")
@@ -99,14 +98,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun formatRadioFrequency(raw: String?, band: String): String {
-        if (raw.isNullOrBlank()) return ""
-        val num = raw.toDoubleOrNull() ?: return raw
+        if (raw.isNullOrBlank()) return "92.3 $band"
+        val num = raw.toDoubleOrNull() ?: return "$raw $band"
         return when {
-            num in 8700.0..10850.0 -> String.format(Locale.US, "%s %.1f MHz", band, num / 100.0)
-            num in 87000.0..108500.0 -> String.format(Locale.US, "%s %.1f MHz", band, num / 1000.0)
-            num in 87.0..108.5 -> String.format(Locale.US, "%s %.1f MHz", band, num)
-            num in 500.0..1750.0 -> String.format(Locale.US, "AM %.0f kHz", num)
-            else -> "$band $raw"
+            num in 8700.0..10850.0 -> String.format(Locale.US, "%.1f %s", num / 100.0, band)
+            num in 87000.0..108500.0 -> String.format(Locale.US, "%.1f %s", num / 1000.0, band)
+            num in 87.0..108.5 -> String.format(Locale.US, "%.1f %s", num, band)
+            num in 500.0..1750.0 -> String.format(Locale.US, "%.0f AM", num)
+            else -> "$raw $band"
         }
     }
 
@@ -218,9 +217,6 @@ class AgamaDashboardView(
     private var primaryColor = prefs.getInt("primary_color_v3", Color.parseColor("#E6192E"))
     private var secondaryColor = prefs.getInt("secondary_color_v3", Color.parseColor("#4A90E2"))
     private val bgDark = Color.parseColor("#0D0F14")
-    private val sharedDarkGray = Color.parseColor("#1E222A")
-    private val podColor = sharedDarkGray
-    private val podPressedColor = Color.parseColor("#2F3542")
     private val innerRingColor = Color.parseColor("#5E6578")
     private val hubBgColor = Color.parseColor("#08090C")
 
@@ -231,7 +227,7 @@ class AgamaDashboardView(
     private var isPlayingState = false
     private var isRadioMode = false
     private var currentSongInfo: String = ""
-    private var currentRadioInfo: String = prefs.getString("last_radio_station", "FM Radio") ?: "FM Radio"
+    private var currentRadioInfo: String = prefs.getString("last_radio_station", "92.3 FM") ?: "92.3 FM"
     private var scrollXOffset = 0f
     private var pressedZone: String? = null
 
@@ -254,15 +250,22 @@ class AgamaDashboardView(
 
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
-    private val basketballDimplePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    // Basketball Dimpled Texture Paint (Used for both Center Hub and Outer Text Wings)
+    private val basketballDimpleCenterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        shader = createBasketballDimpleShader()
+        shader = createBasketballDimpleShader(Color.parseColor("#08090C"), Color.parseColor("#181B22"), Color.parseColor("#030405"))
     }
+    private val basketballDimpleWingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        // 20% darker shade of gray texture for outer wings (#14171E)
+        shader = createBasketballDimpleShader(Color.parseColor("#14171E"), Color.parseColor("#1F242E"), Color.parseColor("#0B0D12"))
+    }
+    private val podPressedColor = Color.parseColor("#252A36")
 
     private val solidInnerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 10f
-        color = sharedDarkGray
+        color = Color.parseColor("#1E222A")
     }
     private val solidInnerRingEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -319,20 +322,20 @@ class AgamaDashboardView(
         color = Color.WHITE
     }
 
-    private fun createBasketballDimpleShader(): BitmapShader {
+    private fun createBasketballDimpleShader(baseColor: Int, highlightColor: Int, pitColor: Int): BitmapShader {
         val size = 18
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
 
-        c.drawColor(hubBgColor)
+        c.drawColor(baseColor)
 
         val rimHighlight = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
-            color = Color.parseColor("#181B22")
+            color = highlightColor
         }
         val dimplePit = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
-            color = Color.parseColor("#030405")
+            color = pitColor
         }
 
         val coords = arrayOf(4.5f to 4.5f, 13.5f to 13.5f)
@@ -453,8 +456,8 @@ class AgamaDashboardView(
         ryOuter: Float
     ) {
         val wingRect = RectF(cx - rxOuter, cy - ryOuter, cx + rxOuter, cy + ryOuter)
-        fillPaint.color = podColor
-        canvas.drawOval(wingRect, fillPaint)
+        // #1: Outer text wings filled with the 20% darker dimpled basketball texture
+        canvas.drawOval(wingRect, basketballDimpleWingPaint)
 
         val y1 = h * 0.19f
         val y2 = h * 0.39f
@@ -620,17 +623,18 @@ class AgamaDashboardView(
             return
         }
 
+        // #2: Displays station numbers (e.g. 92.3 FM) when radio is active
         val rawInfo = when {
             isRadioMode && currentRadioInfo.isNotEmpty() -> currentRadioInfo
             currentSongInfo.isNotEmpty() -> currentSongInfo
-            isRadioMode -> "FM/AM Radio Station Active"
+            isRadioMode -> "92.3 FM"
             else -> "Playing Audio Stream"
         }
 
         val tickerText = "$rawInfo     •     "
         val textWidth = textPaint.measureText(tickerText)
         if (textWidth <= 0f) {
-            canvas.drawText("Playing", cx, y, textPaint)
+            canvas.drawText("92.3 FM", cx, y, textPaint)
             return
         }
 
@@ -667,7 +671,7 @@ class AgamaDashboardView(
         fillPaint.color = Color.parseColor("#040507")
         canvas.drawCircle(cx, cy, rHub + 7f, fillPaint)
 
-        canvas.drawCircle(cx, cy, rHub, basketballDimplePaint)
+        canvas.drawCircle(cx, cy, rHub, basketballDimpleCenterPaint)
 
         val vignette = RadialGradient(
             cx, cy, rHub,
@@ -1164,11 +1168,11 @@ class AgamaDashboardView(
             setPadding(45, 35, 45, 35)
         }
         AlertDialog.Builder(context)
-            .setTitle("Radio / Ticker Display")
-            .setMessage("Toggle Radio Ticker mode or set custom station text:")
+            .setTitle("Radio Station / Frequency")
+            .setMessage("Set custom station frequency (e.g., 92.3 FM):")
             .setView(input)
-            .setPositiveButton("Show Radio Ticker") { _, _ ->
-                val text = input.text.toString().trim().ifEmpty { "FM Radio Active" }
+            .setPositiveButton("Set Radio Mode") { _, _ ->
+                val text = input.text.toString().trim().ifEmpty { "92.3 FM" }
                 updateRadioInfo(text, true)
             }
             .setNeutralButton("Switch to Music") { _, _ ->
@@ -1256,10 +1260,6 @@ class AgamaDashboardView(
         }, 150L)
     }
 
-    /**
-     * Renders any Android app Drawable onto a clean square Bitmap with internal margin
-     * so square app icons/widgets never have their left or right sides cut off.
-     */
     private fun renderUncroppedSquareIcon(drawable: Drawable, boxSizePx: Int): Bitmap {
         val bmp = Bitmap.createBitmap(boxSizePx, boxSizePx, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
@@ -1280,7 +1280,6 @@ class AgamaDashboardView(
         return bmp
     }
 
-    // Full-Width Visual App Drawer with Uncropped Square App Tiles
     private fun showVisualAppDrawer(assignToSlot: String?) {
         val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
@@ -1378,7 +1377,6 @@ class AgamaDashboardView(
             .create()
 
         alertDialog.show()
-        // Expand dialog to 92% of the landscape head unit width so no columns or square icons are ever cut off
         alertDialog.window?.setLayout(
             (screenW * 0.92f).toInt(),
             (screenH * 0.86f).toInt()
