@@ -2,6 +2,7 @@ package com.custom.carlauncher
 
 import android.Manifest
 import android.app.ActivityManager
+import android.app.ActivityOptions
 import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothProfile
@@ -63,7 +64,7 @@ class MainActivity : AppCompatActivity() {
 
     val recentBroadcastLog = LinkedList<String>()
 
-    private val mediaAndRadioReceiver = object : BroadcastReceiver() {
+    private val mediaRadioAndNavReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent == null) return
             val action = intent.action.orEmpty()
@@ -76,11 +77,31 @@ class MainActivity : AppCompatActivity() {
                 while (recentBroadcastLog.size > 18) recentBroadcastLog.removeLast()
             }
 
-            // Refresh UI if Bluetooth connection state changed
             if (action.contains("bluetooth", ignoreCase = true) || action.contains("bt", ignoreCase = true)) {
                 dashboardView.invalidate()
             }
 
+            // 1. Check for CarPlay / Zlink / Navigation Turn-by-Turn Broadcasts
+            if (action.contains("zlink", ignoreCase = true) ||
+                action.contains("tlink", ignoreCase = true) ||
+                action.contains("carplay", ignoreCase = true) ||
+                action.contains("navi", ignoreCase = true) ||
+                hasAnyKey(bundle, "road", "next_road", "turn", "remain_distance", "nav_info", "maneuver")
+            ) {
+                val road = extractFirstString(
+                    bundle,
+                    "next_road", "road", "road_name", "street", "title", "nav_text", "desc", "maneuver"
+                )
+                val dist = extractFirstString(
+                    bundle,
+                    "remain_distance", "distance", "dist", "next_dist", "eta"
+                )
+                val connected = !action.contains("disconnect", ignoreCase = true) &&
+                        !action.contains("exit", ignoreCase = true)
+                dashboardView.updateCarPlayNavData(connected, road, dist)
+            }
+
+            // 2. Check if the broadcast is a Radio power-off / stop signal
             if (action.contains("radio", ignoreCase = true) &&
                 (action.contains("stop", ignoreCase = true) ||
                         action.contains("close", ignoreCase = true) ||
@@ -92,6 +113,7 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
+            // 3. Check if broadcast is from the Head Unit's FM/AM Radio app or MCU
             val isRadioIntent = action.contains("radio", ignoreCase = true) ||
                     action.contains("fm", ignoreCase = true) ||
                     action.contains("mcu", ignoreCase = true) ||
@@ -149,6 +171,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            // 4. Otherwise process as Music / Podcast / Media App Metadata
             val track = extractFirstString(
                 bundle,
                 "track", "title", "music_title", "song", "episode", "name", "android.media.metadata.TITLE"
@@ -238,7 +261,7 @@ class MainActivity : AppCompatActivity() {
         dashboardView = AgamaDashboardView(this, mediaHelper)
         setContentView(dashboardView)
 
-        registerMediaAndRadioBroadcasts()
+        registerMediaRadioAndNavBroadcasts()
         checkAndRequestPermissions()
     }
 
@@ -259,7 +282,6 @@ class MainActivity : AppCompatActivity() {
         if (needed.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, needed.toTypedArray(), 1001)
         }
-        // Start GPS and Weather right away (even if waiting on permission, IP weather still works)
         startGpsAndWeatherUpdates()
     }
 
@@ -276,7 +298,7 @@ class MainActivity : AppCompatActivity() {
         refreshWeatherIfNeeded(force = false, showToast = false)
     }
 
-    private fun registerMediaAndRadioBroadcasts() {
+    private fun registerMediaRadioAndNavBroadcasts() {
         val filter = IntentFilter().apply {
             addAction("com.android.music.metachanged")
             addAction("com.android.music.playstatechanged")
@@ -322,6 +344,13 @@ class MainActivity : AppCompatActivity() {
             addAction("cn.abel.action.broadcast")
             addAction("com.ts.main.radio.info")
 
+            // CarPlay / Zlink / Tlink / Navigation Broadcasts
+            addAction("com.zjinnova.zlink")
+            addAction("com.zjinnova.zlink.action.BACK_CAR")
+            addAction("com.xyauto.broadcast.NAVI_INFO")
+            addAction("AUTONAVI_STANDARD_BROADCAST_SEND")
+            addAction("com.google.android.apps.maps.NAVIGATION_UPDATE")
+
             // Bluetooth state changes
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
@@ -331,16 +360,16 @@ class MainActivity : AppCompatActivity() {
             addAction("com.microntek.bt.report")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(mediaAndRadioReceiver, filter, Context.RECEIVER_EXPORTED)
+            registerReceiver(mediaRadioAndNavReceiver, filter, Context.RECEIVER_EXPORTED)
         } else {
-            registerReceiver(mediaAndRadioReceiver, filter)
+            registerReceiver(mediaRadioAndNavReceiver, filter)
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         try {
-            unregisterReceiver(mediaAndRadioReceiver)
+            unregisterReceiver(mediaRadioAndNavReceiver)
         } catch (_: Exception) {}
     }
 
@@ -349,7 +378,6 @@ class MainActivity : AppCompatActivity() {
             lastLat = location.latitude
             lastLon = location.longitude
 
-            // Calculate speed (either from GPS chip or distance/time delta)
             var mph = if (location.hasSpeed()) (location.speed * 2.23694f).toInt() else 0
             var computedBearing: Float? = if (location.hasBearing() && location.bearing != 0f) {
                 location.bearing
@@ -357,7 +385,6 @@ class MainActivity : AppCompatActivity() {
                 null
             }
 
-            // Fallback: If XYAuto GPS chip doesn't populate bearing/speed, compute from coordinate delta!
             val prev = previousGpsLocation
             if (prev != null) {
                 val distMeters = prev.distanceTo(location)
@@ -367,7 +394,6 @@ class MainActivity : AppCompatActivity() {
                     mph = ((distMeters / timeDeltaSec) * 2.23694f).toInt()
                 }
 
-                // Whenever the car moves at least 2.5 meters, calculate true forward compass heading
                 if (distMeters >= 2.5f) {
                     val rawBearing = prev.bearingTo(location)
                     computedBearing = ((rawBearing % 360f) + 360f) % 360f
@@ -388,7 +414,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startGpsAndWeatherUpdates() {
-        // Always trigger weather check immediately (works over Wi-Fi even before GPS locks)
         refreshWeatherIfNeeded(force = true, showToast = false)
 
         try {
@@ -418,10 +443,6 @@ class MainActivity : AppCompatActivity() {
         } catch (_: SecurityException) {}
     }
 
-    /**
-     * Prevents outdated root SSL certificates on older Android 8/9/10 XYAuto ROMs
-     * from blocking weather HTTPS requests.
-     */
     private fun trustAllSslCertificatesForHeadUnit() {
         try {
             val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
@@ -450,9 +471,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Fetches real-time local temperature (°F) using multi-source GPS + HTTP/HTTPS IP fallback.
-     */
     fun refreshWeatherIfNeeded(force: Boolean, showToast: Boolean) {
         val now = System.currentTimeMillis()
         if (!force && (now - lastWeatherFetchTime) < 10 * 60 * 1000L) return
@@ -463,7 +481,6 @@ class MainActivity : AppCompatActivity() {
                 var lat = lastLat
                 var lon = lastLon
 
-                // Fallback 1: HTTP ip-api.com (immune to SSL certificate issues on Chinese ROMs)
                 if (lat == null || lon == null) {
                     val ipResp = httpGetText("http://ip-api.com/json/")
                     if (ipResp != null) {
@@ -475,7 +492,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // Fallback 2: HTTPS freeipapi.com
                 if (lat == null || lon == null) {
                     val ipResp2 = httpGetText("https://freeipapi.com/api/json")
                     if (ipResp2 != null) {
@@ -514,25 +530,18 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    /**
-     * Checks whether Bluetooth is connected via standard Android BluetoothAdapter, AudioManager,
-     * or XYAuto MCU System Settings/Properties.
-     */
     fun isBluetoothDeviceConnected(): Boolean {
         try {
-            // 1. Check AudioManager Bluetooth A2DP / SCO active routes
             val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
             @Suppress("DEPRECATION")
             if (am.isBluetoothA2dpOn || am.isBluetoothScoOn) return true
 
-            // 2. Check XYAuto / Allwinner / MTC system settings flags
             val btSettingKeys = arrayOf("bt_state", "bt_connected", "bluetooth_connected", "xy_bt_state", "mcu_bt_state")
             for (k in btSettingKeys) {
                 val v = Settings.System.getInt(contentResolver, k, -1)
                 if (v == 1 || v == 2) return true
             }
 
-            // 3. Check standard Android BluetoothAdapter profile connection state
             val adapter = BluetoothAdapter.getDefaultAdapter()
             if (adapter != null && adapter.isEnabled) {
                 val a2dp = adapter.getProfileConnectionState(BluetoothProfile.A2DP)
@@ -540,13 +549,86 @@ class MainActivity : AppCompatActivity() {
                 if (a2dp == BluetoothProfile.STATE_CONNECTED || headset == BluetoothProfile.STATE_CONNECTED) {
                     return true
                 }
-                // If Bluetooth is enabled on an XYAuto unit and paired devices exist
                 if (adapter.bondedDevices?.isNotEmpty() == true) {
                     return true
                 }
             }
         } catch (_: Exception) {}
         return false
+    }
+
+    /**
+     * Checks if Apple CarPlay (Zlink / Tlink / SpeedPlay / CarLink) is connected or active,
+     * or if a phone is actively linked via Bluetooth/USB for CarPlay navigation.
+     */
+    fun isCarPlayConnectedOrActive(): Boolean {
+        try {
+            // Check XYAuto / Zlink system properties
+            val propKeys = arrayOf(
+                "sys.zlink.connected", "persist.sys.zlink.connected",
+                "sys.carplay.connected", "xy.carplay.state"
+            )
+            for (prop in propKeys) {
+                val proc = Runtime.getRuntime().exec(arrayOf("getprop", prop))
+                val line = BufferedReader(InputStreamReader(proc.inputStream)).readLine()?.trim()
+                if (line == "1" || line.equals("true", ignoreCase = true) || line.equals("connected", ignoreCase = true)) {
+                    return true
+                }
+            }
+
+            // Check if Zlink / Tlink / CarPlay process is running in memory
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            @Suppress("DEPRECATION")
+            val procs = am.runningAppProcesses.orEmpty()
+            for (p in procs) {
+                val name = p.processName.lowercase()
+                if (name.contains("zlink") || name.contains("tlink") || name.contains("carplay") ||
+                    name.contains("speedplay") || name.contains("carlink") || name.contains("autokit")
+                ) {
+                    return true
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Also treat active Bluetooth connection as ready for CarPlay Navigation
+        return isBluetoothDeviceConnected()
+    }
+
+    /**
+     * Launches the user's CarPlay / Navigation app (attempts windowed/overlay bounds first,
+     * then falls back to full launch).
+     */
+    fun launchCarPlayNavigationView(prefs: SharedPreferences, rHubPx: Int) {
+        val pm = packageManager
+        val knownCarPlayPkgs = listOf(
+            prefs.getString("pkg_CARPLAY", null),
+            "com.zjinnova.zlink",
+            "com.car.tlink",
+            "cn.manstep.phonemirrorBox",
+            "com.suding.speedplay",
+            "com.google.android.apps.maps"
+        ).filterNotNull()
+
+        var targetIntent: Intent? = null
+        for (pkg in knownCarPlayPkgs) {
+            targetIntent = pm.getLaunchIntentForPackage(pkg)
+            if (targetIntent != null) break
+        }
+
+        if (targetIntent != null) {
+            try {
+                targetIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
+                val cx = resources.displayMetrics.widthPixels / 2
+                val cy = resources.displayMetrics.heightPixels / 2
+                val rect = Rect(cx - rHubPx, cy - rHubPx, cx + rHubPx, cy + rHubPx)
+                val opts = ActivityOptions.makeBasic().setLaunchBounds(rect)
+                startActivity(targetIntent, opts.toBundle())
+            } catch (_: Exception) {
+                startActivity(targetIntent)
+            }
+        } else {
+            Toast.makeText(this, "Long-press CARPLAY wing button to assign your CarPlay/Map app", Toast.LENGTH_SHORT).show()
+        }
     }
 
     fun pollSystemRadioFrequency(): String {
@@ -651,10 +733,21 @@ class AgamaDashboardView(
     private var innerRingColor = prefs.getInt("inner_ring_color_v3", defaultInnerRingGray)
     private var wingBaseColor = prefs.getInt("wing_base_color_v3", defaultWingBaseGray)
 
+    // Center Hub Mode:
+    // 0 = Glossy Subaru Emblem (Default)
+    // 1 = Live GPS Speedometer (MPH)
+    // 2 = Digital Clock + Speed + Compass
+    // 3 = Apple CarPlay Navigation Hub (when connected)
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
+    private var currentBearingDeg = 0f
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
     private var temperatureF = prefs.getInt("temp_f", 59)
+
+    // CarPlay Navigation State
+    private var carPlayExplicitlyConnected = false
+    private var navNextRoad: String = prefs.getString("nav_road", "") ?: ""
+    private var navDistance: String = prefs.getString("nav_dist", "") ?: ""
 
     private var isMediaBroadcastPlaying = false
     private var isRadioActive = prefs.getBoolean("is_radio_active", false)
@@ -842,11 +935,25 @@ class AgamaDashboardView(
     fun updateGpsData(mph: Int, forwardBearing: Float?) {
         currentMph = mph
         if (forwardBearing != null) {
+            currentBearingDeg = forwardBearing
             val dirs = arrayOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
             val norm = ((forwardBearing % 360f) + 360f) % 360f
             val idx = ((norm + 22.5f) / 45f).toInt() % 8
             compassDir = dirs[idx]
             prefs.edit().putString("last_compass", compassDir).apply()
+        }
+        invalidate()
+    }
+
+    fun updateCarPlayNavData(connected: Boolean, road: String, dist: String) {
+        carPlayExplicitlyConnected = connected
+        if (road.isNotEmpty()) {
+            navNextRoad = road
+            prefs.edit().putString("nav_road", road).apply()
+        }
+        if (dist.isNotEmpty()) {
+            navDistance = dist
+            prefs.edit().putString("nav_dist", dist).apply()
         }
         invalidate()
     }
@@ -1020,13 +1127,11 @@ class AgamaDashboardView(
         drawTopLeftClock(canvas, cx - topCornerMidOffset, rowCenters[0], h)
         drawTopRightCompassAndTemp(canvas, cx + topCornerMidOffset, rowCenters[0], h)
 
-        // Bottom-Left Pod: Wi-Fi Signal Strength Icon AND Live Bluetooth Status Icon side-by-side
         val bottomLeftSpacing = h * 0.046f
         val bottomLeftCenter = cx - botCornerMidOffset
         drawWifiSignalIcon(canvas, bottomLeftCenter - bottomLeftSpacing, rowCenters[4], h * 0.032f)
         drawBluetoothStatusIcon(canvas, bottomLeftCenter + bottomLeftSpacing, rowCenters[4], h * 0.031f)
 
-        // Bottom-Right Pod: Dual Settings Gears
         val gearSpacing = h * 0.045f
         drawGearIcon(canvas, cx + botCornerMidOffset - gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
         drawGearIcon(canvas, cx + botCornerMidOffset + gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
@@ -1192,7 +1297,85 @@ class AgamaDashboardView(
                 textPaint.textSize = rHub * 0.16f
                 canvas.drawText("$currentMph MPH • $compassDir", cx, cy + rHub * 0.42f, textPaint)
             }
+            3 -> drawCarPlayNavigationHub(canvas, cx, cy, rHub)
         }
+    }
+
+    /**
+     * Mode 3: Apple CarPlay Navigation Display inside the Center Hub.
+     * Shows live CarPlay Navigation telemetry, directional vector map grid, and heading when connected;
+     * or falls back to the Subaru emblem with a subtle "CarPlay Nav Standby" indicator if disconnected.
+     */
+    private fun drawCarPlayNavigationHub(canvas: Canvas, cx: Float, cy: Float, rHub: Float) {
+        val isConnected = carPlayExplicitlyConnected || mainActivity.isCarPlayConnectedOrActive()
+
+        if (!isConnected) {
+            // If CarPlay isn't connected yet, show the Subaru badge + subtle standby caption
+            drawGlossySubaruBadge(canvas, cx, cy - rHub * 0.06f, rHub * 0.72f, rHub * 0.39f)
+            textPaint.textSize = rHub * 0.11f
+            textPaint.color = secondaryColor
+            canvas.drawText("CARPLAY NAV STANDBY", cx, cy + rHub * 0.62f, textPaint)
+            return
+        }
+
+        // Clip to the circular hub to draw the CarPlay Navigation HUD
+        canvas.save()
+        val clipPath = Path().apply { addCircle(cx, cy, rHub - 4f, Path.Direction.CW) }
+        canvas.clipPath(clipPath)
+
+        // Dark CarPlay Map Night-Mode Perspective Grid
+        fillPaint.color = Color.parseColor("#0B1320")
+        canvas.drawCircle(cx, cy, rHub, fillPaint)
+
+        iconPaint.strokeWidth = 1.6f
+        iconPaint.color = Color.parseColor("#1A2B44")
+        val gridStep = rHub * 0.28f
+        for (i in -3..3) {
+            canvas.drawLine(cx + i * gridStep, cy - rHub, cx + i * gridStep * 1.6f, cy + rHub, iconPaint)
+            canvas.drawLine(cx - rHub, cy + i * gridStep, cx + rHub, cy + i * gridStep, iconPaint)
+        }
+
+        // Glowing Route Path Line
+        iconPaint.strokeWidth = 10f
+        iconPaint.color = Color.parseColor("#2B7DE9")
+        canvas.drawLine(cx, cy + rHub, cx, cy - rHub * 0.12f, iconPaint)
+
+        // 3D CarPlay Navigation Arrow in the Center
+        val arrowY = cy - rHub * 0.10f
+        val arrowSize = rHub * 0.24f
+        canvas.save()
+        canvas.rotate(currentBearingDeg % 360f, cx, arrowY)
+        val navArrow = Path().apply {
+            moveTo(cx, arrowY - arrowSize)
+            lineTo(cx + arrowSize * 0.75f, arrowY + arrowSize * 0.85f)
+            lineTo(cx, arrowY + arrowSize * 0.35f)
+            lineTo(cx - arrowSize * 0.75f, arrowY + arrowSize * 0.85f)
+            close()
+        }
+        fillPaint.color = Color.parseColor("#38BDF8")
+        canvas.drawPath(navArrow, fillPaint)
+        canvas.drawPath(navArrow, thinWhiteStrokePaint)
+        canvas.restore()
+
+        // Top Banner: CarPlay Navigation Status
+        drawRedOutlinedText(canvas, "CARPLAY NAV", cx, cy - rHub * 0.56f, rHub * 0.14f)
+
+        // Middle-Bottom Readout: Next Turn / Street Name + Distance + Live Speed
+        val roadLabel = if (navNextRoad.isNotEmpty()) navNextRoad else "Heading $compassDir • $currentMph MPH"
+        textPaint.color = Color.WHITE
+        textPaint.textSize = rHub * 0.14f
+        canvas.drawText(roadLabel.take(22), cx, cy + rHub * 0.40f, textPaint)
+
+        val subLabel = if (navDistance.isNotEmpty()) {
+            "$navDistance  •  $currentMph MPH"
+        } else {
+            "Double-tap for Full CarPlay Map"
+        }
+        textPaint.color = secondaryColor
+        textPaint.textSize = rHub * 0.105f
+        canvas.drawText(subLabel, cx, cy + rHub * 0.62f, textPaint)
+
+        canvas.restore()
     }
 
     private fun drawGlossySubaruBadge(canvas: Canvas, cx: Float, cy: Float, rx: Float, ry: Float) {
@@ -1456,10 +1639,6 @@ class AgamaDashboardView(
         }
     }
 
-    /**
-     * Draws a blue Bluetooth status icon next to the Wi-Fi icon in the bottom-left pod.
-     * Glows bright blue with connection dots when connected; dims when disconnected.
-     */
     private fun drawBluetoothStatusIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
         val connected = mainActivity.isBluetoothDeviceConnected()
         val dimColor = Color.argb(75, Color.red(secondaryColor), Color.green(secondaryColor), Color.blue(secondaryColor))
@@ -1478,7 +1657,6 @@ class AgamaDashboardView(
         }
         canvas.drawPath(btPath, iconPaint)
 
-        // Draw two small side connection indicator dots when actively connected
         if (connected) {
             fillPaint.color = secondaryColor
             canvas.drawCircle(cx - s * 0.65f, cy, s * 0.13f, fillPaint)
@@ -1503,6 +1681,7 @@ class AgamaDashboardView(
     }
 
     private var downTime = 0L
+    private var lastCenterTapTime = 0L
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val x = event.x
@@ -1605,11 +1784,19 @@ class AgamaDashboardView(
         when (zone) {
             "CENTER_HUB" -> {
                 if (isLongPress) {
-                    LauncherUtils.openHomeSettings(context)
+                    showCenterHubDisplayPicker()
                 } else {
-                    centerMode = (centerMode + 1) % 3
-                    prefs.edit().putInt("center_mode", centerMode).apply()
-                    invalidate()
+                    val now = System.currentTimeMillis()
+                    if (centerMode == 3 && (now - lastCenterTapTime) < 420L) {
+                        // Double-tap while in CarPlay Nav mode opens live CarPlay Map view
+                        mainActivity.launchCarPlayNavigationView(prefs, (height * 0.29f).toInt())
+                    } else {
+                        // Cycle through 4 center display modes (0: Subaru, 1: MPH, 2: Clock, 3: CarPlay Nav)
+                        centerMode = (centerMode + 1) % 4
+                        prefs.edit().putInt("center_mode", centerMode).apply()
+                        invalidate()
+                    }
+                    lastCenterTapTime = now
                 }
             }
             "VOL_DOWN" -> audioManager.adjustStreamVolume(
@@ -1671,6 +1858,33 @@ class AgamaDashboardView(
             "GEAR_SKIN" -> showSkinCustomizerDialog()
             "GEAR_HOME" -> showEscapeHatchDialog()
         }
+    }
+
+    /**
+     * Long-pressing the Center Circle lets you directly pick any of the 4 Center Hub Display Modes
+     * (including Apple CarPlay Navigation) or jump to the Home Switcher.
+     */
+    private fun showCenterHubDisplayPicker() {
+        val modes = arrayOf(
+            "1. Subaru Emblem (Default)",
+            "2. Live GPS Speedometer (MPH)",
+            "3. Digital Clock & Compass",
+            "4. Apple CarPlay Navigation (When Connected)",
+            "Open Stock Launcher / Home Settings"
+        )
+        AlertDialog.Builder(context)
+            .setTitle("Center Circle Display Mode")
+            .setItems(modes) { _, which ->
+                if (which in 0..3) {
+                    centerMode = which
+                    prefs.edit().putInt("center_mode", centerMode).apply()
+                    invalidate()
+                } else {
+                    LauncherUtils.openHomeSettings(context)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun handleSlotAudioModeSwitch(slotKey: String) {
@@ -1946,17 +2160,19 @@ class AgamaDashboardView(
         val options = arrayOf(
             "Switch / Revert to Stock XYAuto Launcher",
             "Open Android System Settings",
+            "Center Circle Display Mode (Subaru / MPH / Clock / CarPlay Nav)",
             "Radio Broadcast Sniffer (Diagnostics)",
             "Reset All Custom Labels, Icons & Shortcuts"
         )
         AlertDialog.Builder(context)
-            .setTitle("System & Launcher Options")
+            .setTitle("Eye of Sauron Car Launcher Options")
             .setItems(options) { _, which ->
                 when (which) {
                     0 -> LauncherUtils.openHomeSettings(context)
                     1 -> context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    2 -> showRadioDiagnosticDialog()
-                    3 -> {
+                    2 -> showCenterHubDisplayPicker()
+                    3 -> showRadioDiagnosticDialog()
+                    4 -> {
                         for (k in wingKeys) {
                             prefs.edit()
                                 .remove("pkg_$k")
