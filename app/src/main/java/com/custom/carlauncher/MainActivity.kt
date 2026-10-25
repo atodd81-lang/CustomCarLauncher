@@ -1,13 +1,17 @@
 package com.custom.carlauncher
 
+import android.Manifest
 import android.app.ActivityManager
 import android.app.AlertDialog
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.graphics.*
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -29,13 +33,21 @@ import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.text.SimpleDateFormat
 import java.util.*
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 import kotlin.math.*
 
 class MainActivity : AppCompatActivity() {
@@ -47,8 +59,8 @@ class MainActivity : AppCompatActivity() {
     private var lastWeatherFetchTime = 0L
     private var lastLat: Double? = null
     private var lastLon: Double? = null
+    private var previousGpsLocation: Location? = null
 
-    // Diagnostic log of the last incoming broadcasts to help identify proprietary XYAuto radio intents
     val recentBroadcastLog = LinkedList<String>()
 
     private val mediaAndRadioReceiver = object : BroadcastReceiver() {
@@ -57,7 +69,6 @@ class MainActivity : AppCompatActivity() {
             val action = intent.action.orEmpty()
             val bundle = intent.extras
 
-            // Record in diagnostic sniffer log (ignore standard battery/time ticks)
             if (!action.contains("BATTERY") && !action.contains("TIME_TICK")) {
                 val keysSummary = bundle?.keySet()?.joinToString(", ") { k -> "$k=${bundle.get(k)}" } ?: "no-extras"
                 val entry = "[${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())}] $action ($keysSummary)"
@@ -65,7 +76,11 @@ class MainActivity : AppCompatActivity() {
                 while (recentBroadcastLog.size > 18) recentBroadcastLog.removeLast()
             }
 
-            // 1. Check if the broadcast is a Radio power-off / stop signal
+            // Refresh UI if Bluetooth connection state changed
+            if (action.contains("bluetooth", ignoreCase = true) || action.contains("bt", ignoreCase = true)) {
+                dashboardView.invalidate()
+            }
+
             if (action.contains("radio", ignoreCase = true) &&
                 (action.contains("stop", ignoreCase = true) ||
                         action.contains("close", ignoreCase = true) ||
@@ -77,7 +92,6 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            // 2. Check if broadcast is from the Head Unit's FM/AM Radio app or MCU
             val isRadioIntent = action.contains("radio", ignoreCase = true) ||
                     action.contains("fm", ignoreCase = true) ||
                     action.contains("mcu", ignoreCase = true) ||
@@ -118,7 +132,6 @@ class MainActivity : AppCompatActivity() {
                     parts.add(radioText)
                 }
 
-                // Fallback: scan any numeric/frequency-looking value inside the bundle
                 if (parts.isEmpty() && bundle != null) {
                     for (key in bundle.keySet()) {
                         val v = bundle.get(key)?.toString()?.trim().orEmpty()
@@ -136,7 +149,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 3. Otherwise process as Music / Podcast / Media App Metadata
             val track = extractFirstString(
                 bundle,
                 "track", "title", "music_title", "song", "episode", "name", "android.media.metadata.TITLE"
@@ -207,15 +219,10 @@ class MainActivity : AppCompatActivity() {
             .trim()
         val num = clean.toDoubleOrNull() ?: return ""
         return when {
-            // e.g. 9230 -> 92.3 FM
             num in 8700.0..10850.0 -> String.format(Locale.US, "%.1f %s", num / 100.0, band.ifEmpty { "FM" })
-            // e.g. 92300 -> 92.3 FM
             num in 87000.0..108500.0 -> String.format(Locale.US, "%.1f %s", num / 1000.0, band.ifEmpty { "FM" })
-            // e.g. 923 -> 92.3 FM
             num in 875.0..1085.0 -> String.format(Locale.US, "%.1f %s", num / 10.0, band.ifEmpty { "FM" })
-            // e.g. 92.3 -> 92.3 FM
             num in 87.0..108.5 -> String.format(Locale.US, "%.1f %s", num, band.ifEmpty { "FM" })
-            // AM Band
             num in 500.0..1750.0 -> String.format(Locale.US, "%.0f AM", num)
             else -> ""
         }
@@ -224,6 +231,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        trustAllSslCertificatesForHeadUnit()
         mediaHelper = MediaControlHelper(this)
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
@@ -231,18 +239,45 @@ class MainActivity : AppCompatActivity() {
         setContentView(dashboardView)
 
         registerMediaAndRadioBroadcasts()
+        checkAndRequestPermissions()
+    }
+
+    private fun checkAndRequestPermissions() {
+        val needed = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+
+        if (needed.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), 1001)
+        }
+        // Start GPS and Weather right away (even if waiting on permission, IP weather still works)
         startGpsAndWeatherUpdates()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            startGpsAndWeatherUpdates()
+        }
     }
 
     override fun onResume() {
         super.onResume()
         dashboardView.syncAudioAndRadioState()
-        refreshWeatherIfNeeded(force = false)
+        refreshWeatherIfNeeded(force = false, showToast = false)
     }
 
     private fun registerMediaAndRadioBroadcasts() {
         val filter = IntentFilter().apply {
-            // Standard Android, Music, and Podcast Player Broadcasts
             addAction("com.android.music.metachanged")
             addAction("com.android.music.playstatechanged")
             addAction("com.android.music.playbackcomplete")
@@ -263,7 +298,7 @@ class MainActivity : AppCompatActivity() {
             addAction("com.bambuna.podcastaddict.service.player.update")
             addAction("de.danoeh.antennapod.intent.PLAYBACK_STATUS")
 
-            // XYAuto / Allwinner / Topway / FYT / Microntek Radio & MCU Broadcasts
+            // XYAuto / MCU Radio & Bluetooth Broadcasts
             addAction("com.microntek.music.toast")
             addAction("com.microntek.music.report")
             addAction("com.xyauto.music.metachanged")
@@ -286,7 +321,14 @@ class MainActivity : AppCompatActivity() {
             addAction("com.glsx.boot.AC_RADIO_INFO")
             addAction("cn.abel.action.broadcast")
             addAction("com.ts.main.radio.info")
-            addAction("com. ATC.radio.info")
+
+            // Bluetooth state changes
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
+            addAction("android.bluetooth.device.action.ACL_CONNECTED")
+            addAction("android.bluetooth.device.action.ACL_DISCONNECTED")
+            addAction("com.xyauto.broadcast.BT_STATE")
+            addAction("com.microntek.bt.report")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(mediaAndRadioReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -302,53 +344,118 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
 
-    private fun startGpsAndWeatherUpdates() {
-        try {
-            // Check last known GPS location immediately so temperature can fetch right away at startup
-            val lastLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-            if (lastLoc != null) {
-                lastLat = lastLoc.latitude
-                lastLon = lastLoc.longitude
-                refreshWeatherIfNeeded(force = true)
+    private val sharedLocationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            lastLat = location.latitude
+            lastLon = location.longitude
+
+            // Calculate speed (either from GPS chip or distance/time delta)
+            var mph = if (location.hasSpeed()) (location.speed * 2.23694f).toInt() else 0
+            var computedBearing: Float? = if (location.hasBearing() && location.bearing != 0f) {
+                location.bearing
+            } else {
+                null
             }
 
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER,
-                500L,
-                0.5f,
-                object : LocationListener {
-                    override fun onLocationChanged(location: Location) {
-                        lastLat = location.latitude
-                        lastLon = location.longitude
+            // Fallback: If XYAuto GPS chip doesn't populate bearing/speed, compute from coordinate delta!
+            val prev = previousGpsLocation
+            if (prev != null) {
+                val distMeters = prev.distanceTo(location)
+                val timeDeltaSec = ((location.time - prev.time) / 1000f).coerceAtLeast(0.5f)
 
-                        val mph = if (location.hasSpeed()) (location.speed * 2.23694f).toInt() else 0
-
-                        // #3: Only update forward-facing car direction when moving (> 2 MPH)
-                        // so stationary GPS jitter while parked doesn't spin the compass
-                        val forwardBearing = if (location.hasBearing() && mph >= 2) {
-                            location.bearing
-                        } else {
-                            null
-                        }
-
-                        dashboardView.updateGpsData(mph, forwardBearing)
-                        refreshWeatherIfNeeded(force = false)
-                    }
-                    @Deprecated("Deprecated in Java")
-                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                if (mph == 0 && distMeters > 1.5f && timeDeltaSec < 15f) {
+                    mph = ((distMeters / timeDeltaSec) * 2.23694f).toInt()
                 }
-            )
+
+                // Whenever the car moves at least 2.5 meters, calculate true forward compass heading
+                if (distMeters >= 2.5f) {
+                    val rawBearing = prev.bearingTo(location)
+                    computedBearing = ((rawBearing % 360f) + 360f) % 360f
+                    previousGpsLocation = location
+                }
+            } else {
+                previousGpsLocation = location
+            }
+
+            dashboardView.updateGpsData(mph, computedBearing)
+            refreshWeatherIfNeeded(force = false, showToast = false)
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+    }
+
+    private fun startGpsAndWeatherUpdates() {
+        // Always trigger weather check immediately (works over Wi-Fi even before GPS locks)
+        refreshWeatherIfNeeded(force = true, showToast = false)
+
+        try {
+            val lastGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            if (lastGps != null) {
+                lastLat = lastGps.latitude
+                lastLon = lastGps.longitude
+            }
+
+            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    400L,
+                    0f,
+                    sharedLocationListener
+                )
+            }
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER,
+                    1000L,
+                    0f,
+                    sharedLocationListener
+                )
+            }
         } catch (_: SecurityException) {}
     }
 
     /**
-     * #2: Automatically fetches real-time local outdoor temperature (°F) from Open-Meteo API
-     * using the car's live GPS coordinates (or IP geolocation fallback if GPS isn't locked yet).
+     * Prevents outdated root SSL certificates on older Android 8/9/10 XYAuto ROMs
+     * from blocking weather HTTPS requests.
      */
-    fun refreshWeatherIfNeeded(force: Boolean) {
+    private fun trustAllSslCertificatesForHeadUnit() {
+        try {
+            val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+                override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) {}
+                override fun checkServerTrusted(certs: Array<X509Certificate>, authType: String) {}
+            })
+            val sc = SSLContext.getInstance("TLS")
+            sc.init(null, trustAllCerts, SecureRandom())
+            HttpsURLConnection.setDefaultSSLSocketFactory(sc.socketFactory)
+            HttpsURLConnection.setDefaultHostnameVerifier { _, _ -> true }
+        } catch (_: Exception) {}
+    }
+
+    private fun httpGetText(urlStr: String): String? {
+        return try {
+            val conn = URL(urlStr).openConnection() as HttpURLConnection
+            conn.connectTimeout = 6000
+            conn.readTimeout = 6000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 CarLauncher")
+            if (conn.responseCode == 200) {
+                BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+            } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Fetches real-time local temperature (°F) using multi-source GPS + HTTP/HTTPS IP fallback.
+     */
+    fun refreshWeatherIfNeeded(force: Boolean, showToast: Boolean) {
         val now = System.currentTimeMillis()
-        if (!force && (now - lastWeatherFetchTime) < 15 * 60 * 1000L) return
+        if (!force && (now - lastWeatherFetchTime) < 10 * 60 * 1000L) return
         lastWeatherFetchTime = now
 
         Thread {
@@ -356,16 +463,26 @@ class MainActivity : AppCompatActivity() {
                 var lat = lastLat
                 var lon = lastLon
 
-                // If GPS hasn't locked onto satellites yet, fall back to Wi-Fi IP coordinates
+                // Fallback 1: HTTP ip-api.com (immune to SSL certificate issues on Chinese ROMs)
                 if (lat == null || lon == null) {
-                    val ipConn = URL("https://ipapi.co/json/").openConnection() as HttpURLConnection
-                    ipConn.connectTimeout = 4000
-                    ipConn.readTimeout = 4000
-                    if (ipConn.responseCode == 200) {
-                        val ipJson = JSONObject(BufferedReader(InputStreamReader(ipConn.inputStream)).readText())
-                        if (ipJson.has("latitude") && ipJson.has("longitude")) {
-                            lat = ipJson.getDouble("latitude")
-                            lon = ipJson.getDouble("longitude")
+                    val ipResp = httpGetText("http://ip-api.com/json/")
+                    if (ipResp != null) {
+                        val j = JSONObject(ipResp)
+                        if (j.has("lat") && j.has("lon")) {
+                            lat = j.getDouble("lat")
+                            lon = j.getDouble("lon")
+                        }
+                    }
+                }
+
+                // Fallback 2: HTTPS freeipapi.com
+                if (lat == null || lon == null) {
+                    val ipResp2 = httpGetText("https://freeipapi.com/api/json")
+                    if (ipResp2 != null) {
+                        val j = JSONObject(ipResp2)
+                        if (j.has("latitude") && j.has("longitude")) {
+                            lat = j.getDouble("latitude")
+                            lon = j.getDouble("longitude")
                         }
                     }
                 }
@@ -373,34 +490,69 @@ class MainActivity : AppCompatActivity() {
                 if (lat != null && lon != null) {
                     val weatherUrl =
                         "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current_weather=true&temperature_unit=fahrenheit"
-                    val conn = URL(weatherUrl).openConnection() as HttpURLConnection
-                    conn.connectTimeout = 5000
-                    conn.readTimeout = 5000
-                    if (conn.responseCode == 200) {
-                        val response = BufferedReader(InputStreamReader(conn.inputStream)).readText()
-                        val json = JSONObject(response)
+                    val weatherResp = httpGetText(weatherUrl)
+                    if (weatherResp != null) {
+                        val json = JSONObject(weatherResp)
                         val current = json.getJSONObject("current_weather")
                         val tempF = current.getDouble("temperature").roundToInt()
                         runOnUiThread {
                             dashboardView.updateLiveTemperature(tempF)
+                            if (showToast) {
+                                Toast.makeText(this, "Live Temp Updated: ${tempF}°F", Toast.LENGTH_SHORT).show()
+                            }
                         }
+                        return@Thread
                     }
                 }
-            } catch (_: Exception) {
-                // Keeps last cached temperature if Wi-Fi/hotspot is offline
-            }
+
+                if (showToast) {
+                    runOnUiThread {
+                        Toast.makeText(this, "Waiting for Wi-Fi / GPS signal to fetch temperature", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (_: Exception) {}
         }.start()
     }
 
     /**
-     * #4: Polls XYAuto System Properties, Settings.System, and SharedPreferences for active Radio Frequency
-     * in case the XYAuto Radio app writes frequency to system memory instead of standard broadcasts.
+     * Checks whether Bluetooth is connected via standard Android BluetoothAdapter, AudioManager,
+     * or XYAuto MCU System Settings/Properties.
      */
+    fun isBluetoothDeviceConnected(): Boolean {
+        try {
+            // 1. Check AudioManager Bluetooth A2DP / SCO active routes
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            @Suppress("DEPRECATION")
+            if (am.isBluetoothA2dpOn || am.isBluetoothScoOn) return true
+
+            // 2. Check XYAuto / Allwinner / MTC system settings flags
+            val btSettingKeys = arrayOf("bt_state", "bt_connected", "bluetooth_connected", "xy_bt_state", "mcu_bt_state")
+            for (k in btSettingKeys) {
+                val v = Settings.System.getInt(contentResolver, k, -1)
+                if (v == 1 || v == 2) return true
+            }
+
+            // 3. Check standard Android BluetoothAdapter profile connection state
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+            if (adapter != null && adapter.isEnabled) {
+                val a2dp = adapter.getProfileConnectionState(BluetoothProfile.A2DP)
+                val headset = adapter.getProfileConnectionState(BluetoothProfile.HEADSET)
+                if (a2dp == BluetoothProfile.STATE_CONNECTED || headset == BluetoothProfile.STATE_CONNECTED) {
+                    return true
+                }
+                // If Bluetooth is enabled on an XYAuto unit and paired devices exist
+                if (adapter.bondedDevices?.isNotEmpty() == true) {
+                    return true
+                }
+            }
+        } catch (_: Exception) {}
+        return false
+    }
+
     fun pollSystemRadioFrequency(): String {
-        // 1. Check Android Settings.System keys commonly written by XYAuto / Allwinner / MTC firmwares
         val sysKeys = arrayOf(
             "radio_freq", "cur_freq", "fm_freq", "xy_radio_freq",
-            " radio_frequency", "RadioFreq", "mcu_radio_freq", "rds_ps"
+            "radio_frequency", "RadioFreq", "mcu_radio_freq", "rds_ps"
         )
         for (k in sysKeys) {
             try {
@@ -417,7 +569,6 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
         }
 
-        // 2. Check Android OS SystemProperties (getprop) for MCU radio frequency variables
         val propKeys = arrayOf(
             "sys.radio.freq", "persist.sys.radio.freq", "sys.xyauto.radio.freq",
             "persist.radio.freq", "hw.radio.freq", "sys.fm.freq"
@@ -433,7 +584,6 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
         }
 
-        // 3. Check if a known Radio package is running in the background
         try {
             val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             @Suppress("DEPRECATION")
@@ -441,7 +591,6 @@ class MainActivity : AppCompatActivity() {
             for (p in procs) {
                 val pkg = p.processName.lowercase()
                 if (pkg.contains("radio") || pkg.contains("fmradio")) {
-                    // Try reading shared preferences of the radio package if accessible
                     val otherCtx = createPackageContext(p.processName, Context.CONTEXT_IGNORE_SECURITY)
                     val prefNames = arrayOf("radio", "fmradio", "config", "settings", "${p.processName}_preferences")
                     for (pf in prefNames) {
@@ -490,10 +639,8 @@ class AgamaDashboardView(
     private val audioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    // #1: Area outside the outermost curved dashes is pure Midnight Black (#000000)
     private val bgMidnightBlack = Color.parseColor("#000000")
 
-    // #5: Legacy Default Installation Theme Colors
     private val defaultPrimaryRed = Color.parseColor("#E6192E")
     private val defaultSecondaryBlue = Color.parseColor("#4A90E2")
     private val defaultInnerRingGray = Color.parseColor("#5E6578")
@@ -509,7 +656,6 @@ class AgamaDashboardView(
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
     private var temperatureF = prefs.getInt("temp_f", 59)
 
-    // Audio & Radio State Tracking
     private var isMediaBroadcastPlaying = false
     private var isRadioActive = prefs.getBoolean("is_radio_active", false)
     private var currentMediaText: String = prefs.getString("last_media_text", "") ?: ""
@@ -548,7 +694,7 @@ class AgamaDashboardView(
         style = Paint.Style.FILL
         shader = createBasketballDimpleShader(
             wingBaseColor,
-             Color.parseColor("#1F242E"),
+            Color.parseColor("#1F242E"),
             Color.parseColor("#080A0E")
         )
     }
@@ -645,7 +791,6 @@ class AgamaDashboardView(
         override fun run() {
             val systemMusicPlaying = audioManager.isMusicActive
 
-            // Periodically poll system radio properties every ~2 seconds when radio is active
             pollCounter++
             if (isRadioActive && pollCounter % 45 == 0) {
                 val polledFreq = mainActivity.pollSystemRadioFrequency()
@@ -694,7 +839,6 @@ class AgamaDashboardView(
         invalidate()
     }
 
-    // #3: Updates forward-facing car direction from GPS movement vector
     fun updateGpsData(mph: Int, forwardBearing: Float?) {
         currentMph = mph
         if (forwardBearing != null) {
@@ -773,7 +917,6 @@ class AgamaDashboardView(
         val cx = w / 2f
         val cy = h / 2f
 
-        // #1: Entire screen outside the outermost curved dashes is pure Midnight Black (#000000)
         canvas.drawColor(bgMidnightBlack)
 
         val rHub = h * 0.29f
@@ -806,7 +949,7 @@ class AgamaDashboardView(
         val rowCenters = floatArrayOf(h * 0.095f, h * 0.29f, h * 0.50f, h * 0.71f, h * 0.905f)
 
         pressedZone?.let { zone ->
-            if (zone.startsWith("WING_") || zone in listOf("CLOCK_TOP_LEFT", "TEMP_TOP_RIGHT", "WIFI_BOTTOM_LEFT", "GEAR_SKIN", "GEAR_HOME")) {
+            if (zone.startsWith("WING_") || zone in listOf("CLOCK_TOP_LEFT", "TEMP_TOP_RIGHT", "WIFI_BOTTOM_LEFT", "BT_BOTTOM_LEFT", "GEAR_SKIN", "GEAR_HOME")) {
                 fillPaint.color = podPressedColor
                 val rowIdx = when (zone) {
                     "CLOCK_TOP_LEFT", "TEMP_TOP_RIGHT" -> 0
@@ -817,7 +960,7 @@ class AgamaDashboardView(
                 }
                 val topY = when (rowIdx) { 0 -> 0f; 1 -> y1; 2 -> y2; 3 -> y3; else -> y4 }
                 val botY = when (rowIdx) { 0 -> y1; 1 -> y2; 2 -> y3; 3 -> y4; else -> h }
-                val isLeft = zone in listOf("CLOCK_TOP_LEFT", "WING_RADIO", "WING_CARPLAY", "WING_MUSIC", "WIFI_BOTTOM_LEFT")
+                val isLeft = zone in listOf("CLOCK_TOP_LEFT", "WING_RADIO", "WING_CARPLAY", "WING_MUSIC", "WIFI_BOTTOM_LEFT", "BT_BOTTOM_LEFT")
                 canvas.save()
                 canvas.clipRect(if (isLeft) 0f else cx, topY, if (isLeft) cx else w, botY)
                 canvas.drawOval(wingRect, fillPaint)
@@ -876,8 +1019,14 @@ class AgamaDashboardView(
 
         drawTopLeftClock(canvas, cx - topCornerMidOffset, rowCenters[0], h)
         drawTopRightCompassAndTemp(canvas, cx + topCornerMidOffset, rowCenters[0], h)
-        drawWifiSignalIcon(canvas, cx - botCornerMidOffset, rowCenters[4], h * 0.035f)
 
+        // Bottom-Left Pod: Wi-Fi Signal Strength Icon AND Live Bluetooth Status Icon side-by-side
+        val bottomLeftSpacing = h * 0.046f
+        val bottomLeftCenter = cx - botCornerMidOffset
+        drawWifiSignalIcon(canvas, bottomLeftCenter - bottomLeftSpacing, rowCenters[4], h * 0.032f)
+        drawBluetoothStatusIcon(canvas, bottomLeftCenter + bottomLeftSpacing, rowCenters[4], h * 0.031f)
+
+        // Bottom-Right Pod: Dual Settings Gears
         val gearSpacing = h * 0.045f
         drawGearIcon(canvas, cx + botCornerMidOffset - gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
         drawGearIcon(canvas, cx + botCornerMidOffset + gearSpacing, rowCenters[4], h * 0.029f, secondaryColor)
@@ -958,7 +1107,6 @@ class AgamaDashboardView(
         val mediaPlaying = systemMusicActive || isMediaBroadcastPlaying
         val radioPlaying = isRadioActive && !systemMusicActive
 
-        // Strictly blank when neither radio nor any media app is playing
         if (!mediaPlaying && !radioPlaying) {
             return
         }
@@ -1298,13 +1446,43 @@ class AgamaDashboardView(
         fillPaint.color = if (level >= 1) secondaryColor else dimColor
         canvas.drawCircle(cx, baseY, s * 0.16f, fillPaint)
 
-        iconPaint.strokeWidth = 4.0f
-        val radii = floatArrayOf(s * 0.50f, s * 0.88f, s * 1.26f)
+        iconPaint.strokeWidth = 3.8f
+        val radii = floatArrayOf(s * 0.48f, s * 0.85f, s * 1.22f)
         for (i in radii.indices) {
             val r = radii[i]
             iconPaint.color = if (level > i) secondaryColor else dimColor
             val arcRect = RectF(cx - r, baseY - r, cx + r, baseY + r)
             canvas.drawArc(arcRect, 225f, 90f, false, iconPaint)
+        }
+    }
+
+    /**
+     * Draws a blue Bluetooth status icon next to the Wi-Fi icon in the bottom-left pod.
+     * Glows bright blue with connection dots when connected; dims when disconnected.
+     */
+    private fun drawBluetoothStatusIcon(canvas: Canvas, cx: Float, cy: Float, s: Float) {
+        val connected = mainActivity.isBluetoothDeviceConnected()
+        val dimColor = Color.argb(75, Color.red(secondaryColor), Color.green(secondaryColor), Color.blue(secondaryColor))
+        val activeColor = if (connected) secondaryColor else dimColor
+
+        iconPaint.color = activeColor
+        iconPaint.strokeWidth = 3.8f
+
+        val btPath = Path().apply {
+            moveTo(cx - s * 0.42f, cy - s * 0.42f)
+            lineTo(cx + s * 0.42f, cy + s * 0.42f)
+            lineTo(cx, cy + s * 0.86f)
+            lineTo(cx, cy - s * 0.86f)
+            lineTo(cx + s * 0.42f, cy - s * 0.42f)
+            lineTo(cx - s * 0.42f, cy + s * 0.42f)
+        }
+        canvas.drawPath(btPath, iconPaint)
+
+        // Draw two small side connection indicator dots when actively connected
+        if (connected) {
+            fillPaint.color = secondaryColor
+            canvas.drawCircle(cx - s * 0.65f, cy, s * 0.13f, fillPaint)
+            canvas.drawCircle(cx + s * 0.65f, cy, s * 0.13f, fillPaint)
         }
     }
 
@@ -1411,10 +1589,13 @@ class AgamaDashboardView(
             y < h * 0.61f -> if (isLeft) "WING_CARPLAY" else "WING_INTERNET"
             y < h * 0.81f -> if (isLeft) "WING_MUSIC" else "WING_APPS"
             else -> {
-                if (isLeft) "WIFI_BOTTOM_LEFT"
-                else {
-                    val botCornerMid = cx + (getDxInner(h * 0.905f, cy, rInner + 4f) + getDxOuter(h * 0.905f, cy, w * 0.47f, h * 0.58f)) / 2f
-                    if (x < botCornerMid) "GEAR_SKIN" else "GEAR_HOME"
+                val midOffset = (getDxInner(h * 0.905f, cy, rInner + 4f) + getDxOuter(h * 0.905f, cy, w * 0.47f, h * 0.58f)) / 2f
+                if (isLeft) {
+                    val botLeftCenter = cx - midOffset
+                    if (x < botLeftCenter) "WIFI_BOTTOM_LEFT" else "BT_BOTTOM_LEFT"
+                } else {
+                    val botRightCenter = cx + midOffset
+                    if (x < botRightCenter) "GEAR_SKIN" else "GEAR_HOME"
                 }
             }
         }
@@ -1439,16 +1620,12 @@ class AgamaDashboardView(
             )
             "MEDIA_PREV" -> mediaHelper.prevTrack()
             "MEDIA_NEXT" -> mediaHelper.nextTrack()
-
-            // Strictly read-only display so audio/radio is never paused on tap
             "MEDIA_INFO_DISPLAY" -> {}
-
             "CLOCK_TOP_LEFT" -> openRecentApps()
 
-            // #2: Tapping temperature triggers an immediate live GPS weather refresh (no manual popup)
             "TEMP_TOP_RIGHT" -> {
                 Toast.makeText(context, "Refreshing live outdoor temperature...", Toast.LENGTH_SHORT).show()
-                mainActivity.refreshWeatherIfNeeded(force = true)
+                mainActivity.refreshWeatherIfNeeded(force = true, showToast = true)
             }
 
             "WIFI_BOTTOM_LEFT" -> {
@@ -1456,6 +1633,14 @@ class AgamaDashboardView(
                     context.startActivity(Intent(Settings.ACTION_WIFI_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 } catch (_: Exception) {
                     context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            }
+
+            "BT_BOTTOM_LEFT" -> {
+                try {
+                    context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                } catch (_: Exception) {
+                    launchAssignedApp("PHONE")
                 }
             }
 
@@ -1720,7 +1905,6 @@ class AgamaDashboardView(
         showVisualAppDrawer(assignToSlot = slotKey)
     }
 
-    // #5: Added "Legacy Default (Original Installation Theme)" at the top of the Theme Picker
     private fun showSkinCustomizerDialog() {
         val themes = arrayOf(
             "Legacy Default (Original Installation Theme)",
