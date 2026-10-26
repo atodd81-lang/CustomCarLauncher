@@ -66,13 +66,13 @@ class MainActivity : AppCompatActivity() {
     lateinit var dashboardView: AgamaDashboardView
     private lateinit var circularMapWebView: WebView
     private var isMapLoaded = false
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private var lastWeatherFetchTime = 0L
     var lastLat: Double? = null
     var lastLon: Double? = null
     private var previousGpsLocation: Location? = null
 
-    // Strictly tracks real-time active Bluetooth ACL & CarPlay session state (never uses static bondedDevices)
     var aclBluetoothConnected = false
     var carPlaySessionActive = false
 
@@ -112,7 +112,7 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            // 3. CarPlay Active Signal from Screen Reader or Zlink/Tlink
+            // 3. CarPlay Active Signal
             if (action == "com.custom.carlauncher.CARPLAY_ACTIVE") {
                 carPlaySessionActive = intent.getBooleanExtra("connected", true)
                 updateCenterMapVisibility()
@@ -265,6 +265,101 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Handles pressing `<` (Previous) or `>` (Next) on the bottom arc of the home screen.
+     * Steps the active Music/Podcast track OR steps the Radio station, then forces an immediate
+     * refresh of the scrolling blue text!
+     */
+    fun stepTrackOrRadioStation(isNext: Boolean, isRadioMode: Boolean, prefs: SharedPreferences) {
+        val beforeRadioText = prefs.getString("last_radio_text", "").orEmpty()
+
+        // 1. Always dispatch standard hardware media key event (works for Spotify, Podcasts, Music, and most Radio apps)
+        if (isNext) {
+            mediaHelper.nextTrack()
+        } else {
+            mediaHelper.prevTrack()
+        }
+
+        // 2. If Radio is active, also send XYAuto / Topway / Microntek MCU Radio Step broadcasts
+        if (isRadioMode) {
+            try {
+                val dir = if (isNext) 1 else -1
+                sendBroadcast(Intent("com.xyauto.broadcast.RADIO_CONTROL").putExtra("cmd", if (isNext) "next" else "prev"))
+                sendBroadcast(Intent("com.car.ui.RADIO_CONTROL").putExtra("action", if (isNext) "next" else "prev"))
+                sendBroadcast(Intent("com.microntek.radio").putExtra("type", if (isNext) "next_channel" else "prev_channel"))
+                sendBroadcast(Intent("com.tw.radio.action").putExtra("step", dir))
+            } catch (_: Exception) {}
+
+            // Ask Accessibility Service to scan all interactive windows right away
+            sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
+
+            // Check after 250ms if the station text updated in SharedPreferences/getprop.
+            // If the XYAuto Radio app only updates its UI when foregrounded, perform a rapid 180ms "Peek & Read" sync!
+            mainHandler.postDelayed({
+                val polled = pollSystemRadioFrequency(prefs)
+                if (polled.isNotEmpty() && polled != beforeRadioText) {
+                    dashboardView.updateRadioInfo(polled, true)
+                } else {
+                    val latestSaved = prefs.getString("last_radio_text", "").orEmpty()
+                    if (latestSaved.isNotEmpty() && latestSaved != beforeRadioText) {
+                        dashboardView.updateRadioInfo(latestSaved, true)
+                    } else if (isAccessibilityReaderEnabled()) {
+                        performQuickRadioUiSync(prefs)
+                    }
+                }
+            }, 260L)
+        } else {
+            // For Music / Podcast apps: trigger multi-stage metadata & notification scan at 250ms and 700ms
+            sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
+            mainHandler.postDelayed({
+                sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
+                dashboardView.syncAudioAndRadioState()
+            }, 350L)
+            mainHandler.postDelayed({
+                dashboardView.syncAudioAndRadioState()
+            }, 850L)
+        }
+    }
+
+    /**
+     * Briefly wakes the mapped Radio window for 180ms so the XYAuto MCU redraws the new station
+     * frequency for our Accessibility Screen Reader, then immediately returns to the Home Launcher.
+     */
+    private fun performQuickRadioUiSync(prefs: SharedPreferences) {
+        val radioPkg = prefs.getString("pkg_RADIO", null) ?: return
+        val radioCls = prefs.getString("cls_RADIO", null)
+        try {
+            prefs.edit().putBoolean("pending_radio_peek", true).apply()
+            val peekIntent = if (!radioCls.isNullOrBlank()) {
+                Intent(Intent.ACTION_MAIN).apply {
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                    component = ComponentName(radioPkg, radioCls)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                }
+            } else {
+                packageManager.getLaunchIntentForPackage(radioPkg)?.apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                }
+            }
+
+            if (peekIntent != null) {
+                startActivity(peekIntent)
+                sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", true))
+                // Guaranteed fallback to bring Eye of Sauron Launcher right back to the front
+                mainHandler.postDelayed({
+                    prefs.edit().putBoolean("pending_radio_peek", false).apply()
+                    val homeIntent = Intent(this, MainActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                    }
+                    startActivity(homeIntent)
+                    dashboardView.syncAudioAndRadioState()
+                }, 320L)
+            }
+        } catch (_: Exception) {
+            prefs.edit().putBoolean("pending_radio_peek", false).apply()
+        }
+    }
+
     private fun hasAnyKey(bundle: Bundle?, vararg keys: String): Boolean {
         if (bundle == null) return false
         for (k in keys) {
@@ -328,8 +423,6 @@ class MainActivity : AppCompatActivity() {
             )
         )
 
-        // Create the Circular Embedded Map View that sits strictly inside the Center Circle
-        // and is ONLY visible when Center Mode == 3 AND an iPhone is actively connected to CarPlay
         circularMapWebView = WebView(this).apply {
             visibility = View.GONE
             setBackgroundColor(Color.parseColor("#08090C"))
@@ -338,7 +431,6 @@ class MainActivity : AppCompatActivity() {
             settings.cacheMode = WebSettings.LOAD_DEFAULT
             webViewClient = WebViewClient()
 
-            // Clip the WebView strictly into a perfect circle matching the center hub
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     outline.setOval(0, 0, view.width, view.height)
@@ -346,7 +438,6 @@ class MainActivity : AppCompatActivity() {
             }
             clipToOutline = true
 
-            // Pass single taps, double taps, and long presses on the center circle back to dashboardView
             setOnTouchListener { _, event ->
                 val globalX = x + event.x
                 val globalY = y + event.y
@@ -367,7 +458,6 @@ class MainActivity : AppCompatActivity() {
         rootContainer.addView(circularMapWebView, FrameLayout.LayoutParams(100, 100, Gravity.CENTER))
         setContentView(rootContainer)
 
-        // Position and size the circular map to fit snugly inside the solid dark grey inner ring
         dashboardView.post {
             val diameter = (dashboardView.height * 0.56f).toInt()
             val lp = FrameLayout.LayoutParams(diameter, diameter, Gravity.CENTER)
@@ -379,9 +469,6 @@ class MainActivity : AppCompatActivity() {
         checkAndRequestPermissions()
     }
 
-    /**
-     * Loads and updates the live dark-mode street map inside the Center Circle when CarPlay is connected.
-     */
     fun updateCenterMapVisibility() {
         if (!::circularMapWebView.isInitialized || !::dashboardView.isInitialized) return
         val shouldShowLiveCircleMap = (dashboardView.getCenterMode() == 3) && isCarPlayActivelyConnected()
@@ -473,12 +560,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun registerMediaRadioAndNavBroadcasts() {
         val filter = IntentFilter().apply {
-            // Internal broadcasts from our RadioScreenReaderService
             addAction("com.custom.carlauncher.RADIO_SCRAPED")
             addAction("com.custom.carlauncher.MEDIA_NOTIFICATION_SCRAPED")
             addAction("com.custom.carlauncher.CARPLAY_ACTIVE")
 
-            // Standard Android, Music, and Podcast Player Broadcasts
             addAction("com.android.music.metachanged")
             addAction("com.android.music.playstatechanged")
             addAction("com.android.music.playbackcomplete")
@@ -499,7 +584,6 @@ class MainActivity : AppCompatActivity() {
             addAction("com.bambuna.podcastaddict.service.player.update")
             addAction("de.danoeh.antennapod.intent.PLAYBACK_STATUS")
 
-            // XYAuto / Topway / Allwinner / FYT / Microntek Radio & MCU Broadcasts
             addAction("com.microntek.music.toast")
             addAction("com.microntek.music.report")
             addAction("com.xyauto.music.metachanged")
@@ -524,13 +608,11 @@ class MainActivity : AppCompatActivity() {
             addAction("cn.abel.action.broadcast")
             addAction("com.ts.main.radio.info")
 
-            // CarPlay / Zlink / Tlink Broadcasts
             addAction("com.zjinnova.zlink")
             addAction("com.zjinnova.zlink.action.BACK_CAR")
             addAction("com.xyauto.broadcast.NAVI_INFO")
             addAction("AUTONAVI_STANDARD_BROADCAST_SEND")
 
-            // Bluetooth state changes
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED)
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
@@ -710,10 +792,6 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    /**
-     * Strictly checks if a Bluetooth device is ACTUALLY connected right now
-     * (Removed bondedDevices check so previously paired phones don't show false positive).
-     */
     fun isBluetoothDeviceConnected(): Boolean {
         if (aclBluetoothConnected) return true
         try {
@@ -740,10 +818,6 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
-    /**
-     * Strictly checks if an iPhone is actively engaged in CarPlay right now.
-     * Returns false whenever an iPhone is disconnected so the Subaru Standby screen appears.
-     */
     fun isCarPlayActivelyConnected(): Boolean {
         if (carPlaySessionActive) return true
         try {
@@ -762,14 +836,7 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
-    /**
-     * Deep-scans the head unit for active FM/AM radio frequency from:
-     * 1. Saved Accessibility Screen Reader value
-     * 2. Mapped Radio package's SharedPreferences XML files
-     * 3. Settings.System & getprop
-     */
     fun pollSystemRadioFrequency(prefs: SharedPreferences): String {
-        // 1. Check if the Mapped Radio App (or any radio package) wrote the frequency to its SharedPreferences
         val candidateRadioPkgs = mutableSetOf(
             prefs.getString("pkg_RADIO", null),
             "com.car.ui",
@@ -800,7 +867,6 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
         }
 
-        // 2. Check Settings.System
         val sysKeys = arrayOf(
             "radio_freq", "cur_freq", "fm_freq", "xy_radio_freq",
             "radio_frequency", "RadioFreq", "mcu_radio_freq", "rds_ps"
@@ -820,7 +886,6 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) {}
         }
 
-        // 3. Check getprop
         val propKeys = arrayOf(
             "sys.radio.freq", "persist.sys.radio.freq", "sys.xyauto.radio.freq",
             "persist.radio.freq", "hw.radio.freq", "sys.fm.freq"
@@ -892,11 +957,6 @@ class AgamaDashboardView(
     private var innerRingColor = prefs.getInt("inner_ring_color_v3", defaultInnerRingGray)
     private var wingBaseColor = prefs.getInt("wing_base_color_v3", defaultWingBaseGray)
 
-    // Center Hub Modes:
-    // 0 = Glossy Subaru Emblem (Default)
-    // 1 = Live GPS Speedometer (MPH)
-    // 2 = Digital Clock + Speed + Compass
-    // 3 = CarPlay Center Map (Shows Subaru Standby when CarPlay is NOT connected; shows Circular Live Map inside circle when connected)
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
@@ -1040,7 +1100,7 @@ class AgamaDashboardView(
             val systemMusicPlaying = audioManager.isMusicActive
 
             pollCounter++
-            if (isRadioActive && pollCounter % 40 == 0) {
+            if (isRadioActive && pollCounter % 35 == 0) {
                 val polledFreq = hostActivity.pollSystemRadioFrequency(prefs)
                 if (polledFreq.isNotEmpty()) {
                     currentRadioText = polledFreq
@@ -1079,6 +1139,10 @@ class AgamaDashboardView(
         val scrapedOrSaved = prefs.getString("last_radio_text", "").orEmpty()
         if (scrapedOrSaved.isNotEmpty()) {
             currentRadioText = scrapedOrSaved
+        }
+        val savedMedia = prefs.getString("last_media_text", "").orEmpty()
+        if (savedMedia.isNotEmpty() && currentMediaText.isEmpty()) {
+            currentMediaText = savedMedia
         }
         val sysFreq = hostActivity.pollSystemRadioFrequency(prefs)
         if (sysFreq.isNotEmpty()) {
@@ -1366,7 +1430,6 @@ class AgamaDashboardView(
         val mediaPlaying = systemMusicActive || isMediaBroadcastPlaying
         val radioPlaying = isRadioActive && !systemMusicActive
 
-        // Strictly blank when neither radio nor any media app is playing
         if (!mediaPlaying && !radioPlaying) {
             return
         }
@@ -1453,8 +1516,6 @@ class AgamaDashboardView(
                 canvas.drawText("$currentMph MPH • $compassDir", cx, cy + rHub * 0.42f, textPaint)
             }
             3 -> {
-                // Mode 3: If CarPlay is NOT actively connected, show the Subaru Emblem + Standby message!
-                // (When CarPlay IS connected, circularMapWebView automatically renders the live map inside the circle).
                 if (!hostActivity.isCarPlayActivelyConnected()) {
                     drawGlossySubaruBadge(canvas, cx, cy - rHub * 0.06f, rHub * 0.72f, rHub * 0.39f)
                     textPaint.textSize = rHub * 0.11f
@@ -1887,8 +1948,14 @@ class AgamaDashboardView(
             "VOL_UP" -> audioManager.adjustStreamVolume(
                 AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI
             )
-            "MEDIA_PREV" -> mediaHelper.prevTrack()
-            "MEDIA_NEXT" -> mediaHelper.nextTrack()
+            "MEDIA_PREV" -> {
+                val radioPlaying = isRadioActive && !audioManager.isMusicActive
+                hostActivity.stepTrackOrRadioStation(isNext = false, isRadioMode = radioPlaying, prefs = prefs)
+            }
+            "MEDIA_NEXT" -> {
+                val radioPlaying = isRadioActive && !audioManager.isMusicActive
+                hostActivity.stepTrackOrRadioStation(isNext = true, isRadioMode = radioPlaying, prefs = prefs)
+            }
             "MEDIA_INFO_DISPLAY" -> {}
             "CLOCK_TOP_LEFT" -> openRecentApps()
 
@@ -1983,7 +2050,6 @@ class AgamaDashboardView(
             }
             invalidate()
 
-            // Prompt once to enable the Accessibility Radio Screen Reader if not enabled yet
             if (!hostActivity.isAccessibilityReaderEnabled() && !prefs.getBoolean("asked_a11y", false)) {
                 prefs.edit().putBoolean("asked_a11y", true).apply()
                 Toast.makeText(
@@ -2219,15 +2285,10 @@ class AgamaDashboardView(
         )
     }
 
-    /**
-     * Strictly launches the exact app and activity class you assigned to the button.
-     * Never falls back to Google Maps!
-     */
     private fun launchAssignedApp(slotKey: String) {
         val pkg = prefs.getString("pkg_$slotKey", null)
         val cls = prefs.getString("cls_$slotKey", null)
 
-        // 1. Always launch your saved ComponentName (Package + Activity Class) first!
         if (!pkg.isNullOrBlank() && !cls.isNullOrBlank()) {
             try {
                 val exactIntent = Intent(Intent.ACTION_MAIN).apply {
@@ -2240,7 +2301,6 @@ class AgamaDashboardView(
             } catch (_: Exception) {}
         }
 
-        // 2. Fallback to standard package launch intent if class name changed
         if (!pkg.isNullOrBlank()) {
             val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
             if (launchIntent != null) {
@@ -2249,7 +2309,6 @@ class AgamaDashboardView(
             }
         }
 
-        // 3. If nothing is assigned yet, open the visual App Drawer so you can pick the app
         showVisualAppDrawer(assignToSlot = slotKey)
     }
 
