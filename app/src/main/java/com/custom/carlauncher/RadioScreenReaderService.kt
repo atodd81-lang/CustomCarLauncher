@@ -22,6 +22,9 @@ class RadioScreenReaderService : AccessibilityService() {
     private val fmRegex = Pattern.compile("\\b(8[7-9]\\.[0-9]{1,2}|9[0-9]\\.[0-9]{1,2}|10[0-8]\\.[0-9]{1,2})\\b")
     private val amRegex = Pattern.compile("\\b([5-9][0-9]0|1[0-7][0-9]0)\\b")
 
+    // Matches iPhone Bluetooth/CarPlay temperature tags like TEMP:62 or TEMP:55F
+    private val tempTagRegex = Pattern.compile("TEMP:(-?\\d{1,3})", Pattern.CASE_INSENSITIVE)
+
     private val ignoreUiWords = setOf(
         "playing", "band", "settings", "sensitivity", "loc", "dx", "rds enable",
         "af enable", "area select", "usa", "europe", "fm", "fm1", "fm2", "fm3",
@@ -29,7 +32,6 @@ class RadioScreenReaderService : AccessibilityService() {
         "pty", "ta", "af", "reg", "radio", "tuner"
     )
 
-    // Listens for forced rescan requests right after the user presses < or > on the launcher
     private val forceScanReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == "com.custom.carlauncher.FORCE_A11Y_SCAN") {
@@ -57,11 +59,23 @@ class RadioScreenReaderService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
+    private fun checkAndBroadcastIphoneTempTag(rawText: String): Boolean {
+        val matcher = tempTagRegex.matcher(rawText)
+        if (matcher.find()) {
+            val tempVal = matcher.group(1)?.toIntOrNull()
+            if (tempVal != null) {
+                sendBroadcast(Intent("com.custom.carlauncher.IPHONE_TEMP_RECEIVED").putExtra("temp_f", tempVal))
+                return true
+            }
+        }
+        return false
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val pkg = event.packageName?.toString()?.lowercase(Locale.US) ?: return
 
-        // 1. Capture Rich Media / Podcast / Music Player Notification Updates (even when on Home Screen!)
+        // 1. Capture Notification / Toast Updates (and check for iPhone TEMP:XX tags)
         if (event.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
             val parcelable = event.parcelableData
             if (parcelable is Notification) {
@@ -69,6 +83,9 @@ class RadioScreenReaderService : AccessibilityService() {
                 val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
                 val text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
                 val subText = extras?.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()?.trim().orEmpty()
+
+                val combinedRaw = "$title $text $subText"
+                if (checkAndBroadcastIphoneTempTag(combinedRaw)) return
 
                 val parts = listOf(title, text, subText).filter { it.isNotEmpty() }.distinct()
                 if (parts.isNotEmpty() && pkg != "com.custom.carlauncher") {
@@ -78,8 +95,12 @@ class RadioScreenReaderService : AccessibilityService() {
             }
 
             val eventTexts = event.text.mapNotNull { it?.toString()?.trim() }.filter { it.isNotEmpty() }
-            if (eventTexts.isNotEmpty() && pkg != "com.custom.carlauncher") {
-                broadcastCapturedMedia(pkg, eventTexts.joinToString("  —  "))
+            if (eventTexts.isNotEmpty()) {
+                val joined = eventTexts.joinToString("  —  ")
+                if (checkAndBroadcastIphoneTempTag(joined)) return
+                if (pkg != "com.custom.carlauncher") {
+                    broadcastCapturedMedia(pkg, joined)
+                }
             }
             return
         }
@@ -114,7 +135,7 @@ class RadioScreenReaderService : AccessibilityService() {
                     performGlobalAction(GLOBAL_ACTION_HOME)
                 }
             }
-        } else if (mappedMusicPkg.isNotEmpty() && pkg == mappedMusicPkg) {
+        } else if ((mappedMusicPkg.isNotEmpty() && pkg == mappedMusicPkg) || isCarPlayPackage) {
             val rootNode = rootInActiveWindow ?: event.source
             if (rootNode != null) {
                 parseAndBroadcastMusicNode(pkg, rootNode)
@@ -122,9 +143,6 @@ class RadioScreenReaderService : AccessibilityService() {
         }
     }
 
-    /**
-     * Scans all interactive windows (including background/split windows) for Radio or Media text.
-     */
     private fun scanAllInteractiveWindows(returnHomeAfter: Boolean) {
         val prefs = getSharedPreferences("agama_subaru_prefs", Context.MODE_PRIVATE)
         var foundStation = false
@@ -168,8 +186,9 @@ class RadioScreenReaderService : AccessibilityService() {
         for (raw in collectedTexts) {
             val clean = raw.trim()
             if (clean.isEmpty()) continue
-            val lower = clean.lowercase(Locale.US)
+            if (checkAndBroadcastIphoneTempTag(clean)) continue
 
+            val lower = clean.lowercase(Locale.US)
             if (lower in ignoreUiWords) continue
             if (clean.contains(":") && (lower.endsWith("am") || lower.endsWith("pm") || clean.length <= 5)) continue
 
@@ -215,6 +234,9 @@ class RadioScreenReaderService : AccessibilityService() {
     private fun parseAndBroadcastMusicNode(pkg: String, rootNode: AccessibilityNodeInfo) {
         val collectedTexts = mutableListOf<String>()
         collectNodeTexts(rootNode, collectedTexts)
+        for (raw in collectedTexts) {
+            if (checkAndBroadcastIphoneTempTag(raw)) return
+        }
         val meaningful = collectedTexts.filter {
             val l = it.lowercase(Locale.US)
             it.length in 3..60 && !it.contains(":") && l !in ignoreUiWords
