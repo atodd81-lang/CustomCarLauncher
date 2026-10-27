@@ -2,7 +2,6 @@ package com.custom.carlauncher
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.ActivityManager
 import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -47,12 +46,18 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.io.PrintWriter
 import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.net.URL
+import java.net.URLDecoder
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.regex.Pattern
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
@@ -67,6 +72,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var circularMapWebView: WebView
     private var isMapLoaded = false
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var iphoneWeatherServer: ServerSocket? = null
+    @Volatile
+    private var isServerRunning = false
 
     private var lastWeatherFetchTime = 0L
     var lastLat: Double? = null
@@ -92,6 +101,15 @@ class MainActivity : AppCompatActivity() {
                 val entry = "[${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())}] $action ($keysSummary)"
                 recentBroadcastLog.addFirst(entry)
                 while (recentBroadcastLog.size > 20) recentBroadcastLog.removeLast()
+            }
+
+            // 0. Live Temperature Received Directly from iPhone (via Bluetooth Tag or Local Bridge)
+            if (action == "com.custom.carlauncher.IPHONE_TEMP_RECEIVED") {
+                val tempVal = intent.getIntExtra("temp_f", -999)
+                if (tempVal != -999) {
+                    dashboardView.updateLiveTemperature(tempVal)
+                }
+                return
             }
 
             // 1. Live Radio Station Text scraped from our RadioScreenReaderService
@@ -246,6 +264,17 @@ class MainActivity : AppCompatActivity() {
                 "album", "music_album", "series", "station", "bt_album", "avrcp_album", "android.media.metadata.ALBUM"
             )
 
+            // Check if the iPhone passed a TEMP:XX tag inside the AVRCP/Bluetooth track title
+            val combinedMeta = "$track $artist $album"
+            val tempMatcher = Pattern.compile("TEMP:(-?\\d{1,3})", Pattern.CASE_INSENSITIVE).matcher(combinedMeta)
+            if (tempMatcher.find()) {
+                val parsedTemp = tempMatcher.group(1)?.toIntOrNull()
+                if (parsedTemp != null) {
+                    dashboardView.updateLiveTemperature(parsedTemp)
+                    return
+                }
+            }
+
             val isPlaying = when {
                 action.contains("playbackcomplete", ignoreCase = true) -> false
                 action.contains("pause", ignoreCase = true) -> false
@@ -270,9 +299,84 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Controls CarPlay Spotify (Play/Pause, Next, Previous) when the Center Hub is in Mode 4 (5th option).
-     * Sends commands to the active CarPlay / iPhone AVRCP session rather than launching any local Android Spotify app.
+     * Starts a tiny local HTTP listener on Port 8765 so an iPhone connected via CarPlay
+     * (Wired USB or Wireless CarPlay bridge) can push its live Apple Weather temperature
+     * directly to the head unit without needing Wi-Fi internet access!
+     *
+     * Example URL called by iPhone Shortcut:
+     * http://192.168.43.1:8765/weather?temp=64
      */
+    private fun startIphoneLocalWeatherServer() {
+        if (isServerRunning) return
+        isServerRunning = true
+        Thread {
+            try {
+                val server = ServerSocket(8765)
+                iphoneWeatherServer = server
+                while (isServerRunning) {
+                    val client = server.accept()
+                    Thread {
+                        try {
+                            client.soTimeout = 3000
+                            val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                            val requestLine = reader.readLine().orEmpty()
+                            // e.g. GET /weather?temp=64&compass=NE HTTP/1.1
+                            if (requestLine.isNotEmpty()) {
+                                val decoded = URLDecoder.decode(requestLine, "UTF-8")
+                                val tempMatch = Pattern.compile("temp=([-+]?\\d{1,3})", Pattern.CASE_INSENSITIVE).matcher(decoded)
+                                if (tempMatch.find()) {
+                                    val tempF = tempMatch.group(1)?.toIntOrNull()
+                                    if (tempF != null) {
+                                        runOnUiThread {
+                                            dashboardView.updateLiveTemperature(tempF)
+                                            carPlaySessionActive = true
+                                            updateCenterMapVisibility()
+                                        }
+                                    }
+                                }
+                            }
+                            val out = PrintWriter(client.getOutputStream(), true)
+                            out.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                            out.flush()
+                            client.close()
+                        } catch (_: Exception) {
+                            try { client.close() } catch (_: Exception) {}
+                        }
+                    }.start()
+                }
+            } catch (_: Exception) {
+                isServerRunning = false
+            }
+        }.start()
+    }
+
+    /**
+     * Returns all active local IPv4 addresses on the head unit (e.g., CarPlay P2P bridge, USB0, or WLAN0)
+     * so the user knows the exact IP address for the iPhone Shortcut.
+     */
+    fun getLocalBridgeIpAddresses(): String {
+        val ips = mutableListOf<String>()
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val nif = interfaces.nextElement()
+                if (!nif.isUp || nif.isLoopback) continue
+                val addrs = nif.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        ips.add("${nif.name}: http://${addr.hostAddress}:8765/weather?temp=")
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return if (ips.isNotEmpty()) {
+            ips.joinToString("\n")
+        } else {
+            "http://192.168.43.1:8765/weather?temp="
+        }
+    }
+
     fun controlCarPlaySpotify(command: String) {
         when (command) {
             "PLAY_PAUSE" -> {
@@ -492,12 +596,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         registerMediaRadioAndNavBroadcasts()
+        startIphoneLocalWeatherServer()
         checkAndRequestPermissions()
     }
 
     fun updateCenterMapVisibility() {
         if (!::circularMapWebView.isInitialized || !::dashboardView.isInitialized) return
-        // Circular map WebView is ONLY visible on Mode 3 (4th option) when CarPlay is actively connected
         val shouldShowLiveCircleMap = (dashboardView.getCenterMode() == 3) && isCarPlayActivelyConnected()
 
         if (shouldShowLiveCircleMap) {
@@ -587,6 +691,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun registerMediaRadioAndNavBroadcasts() {
         val filter = IntentFilter().apply {
+            addAction("com.custom.carlauncher.IPHONE_TEMP_RECEIVED")
             addAction("com.custom.carlauncher.RADIO_SCRAPED")
             addAction("com.custom.carlauncher.MEDIA_NOTIFICATION_SCRAPED")
             addAction("com.custom.carlauncher.CARPLAY_ACTIVE")
@@ -657,9 +762,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        try {
-            unregisterReceiver(mediaRadioAndNavReceiver)
-        } catch (_: Exception) {}
+        isServerRunning = false
+        try { iphoneWeatherServer?.close() } catch (_: Exception) {}
+        try { unregisterReceiver(mediaRadioAndNavReceiver) } catch (_: Exception) {}
     }
 
     private val sharedLocationListener = object : LocationListener {
@@ -808,12 +913,6 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                         return@Thread
-                    }
-                }
-
-                if (showToast) {
-                    runOnUiThread {
-                        Toast.makeText(this, "Waiting for Wi-Fi / GPS signal to fetch temperature", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (_: Exception) {}
@@ -986,12 +1085,6 @@ class AgamaDashboardView(
     private var innerRingColor = prefs.getInt("inner_ring_color_v3", defaultInnerRingGray)
     private var wingBaseColor = prefs.getInt("wing_base_color_v3", defaultWingBaseGray)
 
-    // 5 Center Hub Modes:
-    // 0 = Glossy Subaru Emblem (Default)
-    // 1 = Live GPS Speedometer (MPH)
-    // 2 = Digital Clock + Speed + Compass
-    // 3 = CarPlay Center Circle Map (Subaru Standby when disconnected; Live Map inside circle when connected)
-    // 4 = CarPlay Spotify Hub (Subaru Standby with Spotify message when disconnected; CarPlay Spotify Info & Controls when connected)
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
@@ -1564,7 +1657,6 @@ class AgamaDashboardView(
                 canvas.drawText("$currentMph MPH • $compassDir", cx, cy + rHub * 0.42f, textPaint)
             }
             3 -> {
-                // 4th Option: CarPlay Map (shows Subaru Standby when CarPlay is not connected)
                 if (!hostActivity.isCarPlayActivelyConnected()) {
                     drawGlossySubaruBadge(canvas, cx, cy - rHub * 0.06f, rHub * 0.72f, rHub * 0.39f)
                     textPaint.textSize = rHub * 0.11f
@@ -1573,8 +1665,6 @@ class AgamaDashboardView(
                 }
             }
             4 -> {
-                // 5th Option: CarPlay Spotify Hub (shows Subaru Standby when CarPlay is not connected;
-                // shows CarPlay Spotify track info & interactive playback controls when CarPlay IS connected)
                 drawCarPlaySpotifyHub(canvas, cx, cy, rHub)
             }
         }
@@ -1589,12 +1679,10 @@ class AgamaDashboardView(
             return
         }
 
-        // Clip inside the center circle
         canvas.save()
         val clipPath = Path().apply { addCircle(cx, cy, rHub - 4f, Path.Direction.CW) }
         canvas.clipPath(clipPath)
 
-        // Subtle Spotify dark emerald radial glow at top of hub
         val spotGlow = RadialGradient(
             cx, cy - rHub * 0.35f, rHub * 0.95f,
             intArrayOf(Color.argb(65, 29, 185, 84), Color.TRANSPARENT),
@@ -1605,13 +1693,11 @@ class AgamaDashboardView(
         canvas.drawCircle(cx, cy, rHub, fillPaint)
         fillPaint.shader = null
 
-        // 1. Vector Spotify Logo Badge at Top of Circle
         val logoY = cy - rHub * 0.58f
         val logoR = rHub * 0.14f
         fillPaint.color = spotifyGreen
         canvas.drawCircle(cx, logoY, logoR, fillPaint)
 
-        // 3 Curved Black Sound Waves inside Spotify Circle
         iconPaint.color = Color.parseColor("#08090C")
         iconPaint.strokeWidth = rHub * 0.024f
         canvas.drawArc(RectF(cx - logoR * 0.68f, logoY - logoR * 0.45f, cx + logoR * 0.68f, logoY + logoR * 0.35f), 205f, 130f, false, iconPaint)
@@ -1620,12 +1706,10 @@ class AgamaDashboardView(
         iconPaint.strokeWidth = rHub * 0.017f
         canvas.drawArc(RectF(cx - logoR * 0.44f, logoY + logoR * 0.12f, cx + logoR * 0.44f, logoY + logoR * 0.72f), 212f, 116f, false, iconPaint)
 
-        // 2. "CARPLAY SPOTIFY" Header
         textPaint.color = spotifyGreen
         textPaint.textSize = rHub * 0.105f
         canvas.drawText("CARPLAY SPOTIFY", cx, cy - rHub * 0.32f, textPaint)
 
-        // 3. Song Title & Artist Readout (from iPhone CarPlay stream)
         textPaint.color = Color.WHITE
         textPaint.textSize = rHub * 0.14f
         val displayTitle = currentTrackTitle.ifBlank { "Spotify Active" }.take(20)
@@ -1636,33 +1720,28 @@ class AgamaDashboardView(
         val displayArtist = currentTrackArtist.ifBlank { "iPhone CarPlay Audio" }.take(24)
         canvas.drawText(displayArtist, cx, cy + rHub * 0.08f, textPaint)
 
-        // 4. Interactive Transport Control Buttons in Lower Half of Circle (|<<   Play/Pause   >>|)
         val ctrlY = cy + rHub * 0.44f
         val btnSpacing = rHub * 0.46f
         val playBtnRadius = rHub * 0.17f
         val sideBtnRadius = rHub * 0.13f
 
-        // Previous Button Circle (Left)
         fillPaint.color = if (pressedZone == "SPOTIFY_PREV") podPressedColor else Color.parseColor("#1E242E")
         canvas.drawCircle(cx - btnSpacing, ctrlY, sideBtnRadius, fillPaint)
         canvas.drawCircle(cx - btnSpacing, ctrlY, sideBtnRadius, thinWhiteStrokePaint)
         drawRedOutlinedText(canvas, "|<", cx - btnSpacing, ctrlY + rHub * 0.045f, rHub * 0.12f)
 
-        // Play / Pause Button Circle (Center)
         fillPaint.color = if (pressedZone == "SPOTIFY_PLAY_PAUSE") Color.parseColor("#25E065") else spotifyGreen
         canvas.drawCircle(cx, ctrlY, playBtnRadius, fillPaint)
         canvas.drawCircle(cx, ctrlY, playBtnRadius, thinWhiteStrokePaint)
 
         val isPlayingNow = audioManager.isMusicActive || isMediaBroadcastPlaying
         if (isPlayingNow) {
-            // Draw Pause Bars
             fillPaint.color = Color.parseColor("#08090C")
             val barW = playBtnRadius * 0.22f
             val barH = playBtnRadius * 0.46f
             canvas.drawRoundRect(RectF(cx - barW * 1.6f, ctrlY - barH, cx - barW * 0.4f, ctrlY + barH), 3f, 3f, fillPaint)
             canvas.drawRoundRect(RectF(cx + barW * 0.4f, ctrlY - barH, cx + barW * 1.6f, ctrlY + barH), 3f, 3f, fillPaint)
         } else {
-            // Draw Play Triangle
             val playTri = Path().apply {
                 moveTo(cx - playBtnRadius * 0.25f, ctrlY - playBtnRadius * 0.42f)
                 lineTo(cx + playBtnRadius * 0.45f, ctrlY)
@@ -1673,7 +1752,6 @@ class AgamaDashboardView(
             canvas.drawPath(playTri, fillPaint)
         }
 
-        // Next Button Circle (Right)
         fillPaint.color = if (pressedZone == "SPOTIFY_NEXT") podPressedColor else Color.parseColor("#1E242E")
         canvas.drawCircle(cx + btnSpacing, ctrlY, sideBtnRadius, fillPaint)
         canvas.drawCircle(cx + btnSpacing, ctrlY, sideBtnRadius, thinWhiteStrokePaint)
@@ -2032,8 +2110,6 @@ class AgamaDashboardView(
         val rInner = h * 0.465f
 
         if (dist <= rHub) {
-            // If in Mode 4 (5th option: CarPlay Spotify) AND CarPlay is connected,
-            // check if the user tapped one of the 3 transport control buttons in the lower half of the circle
             if (centerMode == 4 && hostActivity.isCarPlayActivelyConnected() && dy > rHub * 0.18f) {
                 val btnSpacing = rHub * 0.46f
                 return when {
@@ -2104,7 +2180,6 @@ class AgamaDashboardView(
                 if (isLongPress) {
                     showCenterHubDisplayPicker()
                 } else {
-                    // Cycles cleanly through all 5 Center Modes (0, 1, 2, 3, 4)
                     centerMode = (centerMode + 1) % 5
                     prefs.edit().putInt("center_mode", centerMode).apply()
                     hostActivity.updateCenterMapVisibility()
@@ -2145,8 +2220,12 @@ class AgamaDashboardView(
             "CLOCK_TOP_LEFT" -> openRecentApps()
 
             "TEMP_TOP_RIGHT" -> {
-                Toast.makeText(context, "Refreshing live outdoor temperature...", Toast.LENGTH_SHORT).show()
-                hostActivity.refreshWeatherIfNeeded(force = true, showToast = true)
+                if (isLongPress) {
+                    showIphoneWeatherBridgeInfoDialog()
+                } else {
+                    Toast.makeText(context, "Refreshing temperature (Long-press for iPhone Bridge info)...", Toast.LENGTH_SHORT).show()
+                    hostActivity.refreshWeatherIfNeeded(force = true, showToast = true)
+                }
             }
 
             "WIFI_BOTTOM_LEFT" -> {
@@ -2192,6 +2271,21 @@ class AgamaDashboardView(
             "GEAR_SKIN" -> showSkinCustomizerDialog()
             "GEAR_HOME" -> showEscapeHatchDialog()
         }
+    }
+
+    private fun showIphoneWeatherBridgeInfoDialog() {
+        val bridgeUrls = hostActivity.getLocalBridgeIpAddresses()
+        val msg = "To feed live iPhone Weather to this head unit without Wi-Fi:\n\n" +
+                "1. Open the 'Shortcuts' app on the iPhone -> Automation -> New Automation -> CarPlay -> 'When CarPlay Connects' (Run Immediately).\n\n" +
+                "2. Add action: 'Get Current Weather at Current Location'.\n\n" +
+                "3. Add action: 'Get Contents of URL' and use this local bridge URL (append the Weather 'Temperature' variable at the end):\n\n" +
+                "$bridgeUrls[Temperature]"
+
+        AlertDialog.Builder(context)
+            .setTitle("iPhone CarPlay Weather Bridge")
+            .setMessage(msg)
+            .setPositiveButton("Close", null)
+            .show()
     }
 
     private fun showCenterHubDisplayPicker() {
@@ -2542,6 +2636,7 @@ class AgamaDashboardView(
             "Enable Radio Screen Reader ($readerStatus)",
             "Center Circle Mode (Subaru / MPH / Clock / Map / Spotify)",
             "Toggle CarPlay Active State ($cpSimulated)",
+            "iPhone Weather Bridge Setup Info (No Wi-Fi Needed)",
             "Switch / Revert to Stock XYAuto Launcher",
             "Open Android System Settings",
             "Radio & App Inspector (Diagnostics)",
@@ -2565,10 +2660,11 @@ class AgamaDashboardView(
                         hostActivity.updateCenterMapVisibility()
                         invalidate()
                     }
-                    3 -> LauncherUtils.openHomeSettings(context)
-                    4 -> context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    5 -> showRadioDiagnosticDialog()
-                    6 -> {
+                    3 -> showIphoneWeatherBridgeInfoDialog()
+                    4 -> LauncherUtils.openHomeSettings(context)
+                    5 -> context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    6 -> showRadioDiagnosticDialog()
+                    7 -> {
                         for (k in wingKeys) {
                             prefs.edit()
                                 .remove("pkg_$k")
