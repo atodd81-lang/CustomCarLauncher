@@ -107,7 +107,11 @@ class MainActivity : AppCompatActivity() {
             if (action == "com.custom.carlauncher.MEDIA_NOTIFICATION_SCRAPED") {
                 val text = intent.getStringExtra("text").orEmpty()
                 if (text.isNotEmpty()) {
-                    dashboardView.updateMediaInfo(text, "", "", true)
+                    val parts = text.split("—").map { it.trim() }
+                    val tTitle = parts.getOrNull(0).orEmpty()
+                    val tArtist = parts.getOrNull(1).orEmpty()
+                    val tAlbum = parts.getOrNull(2).orEmpty()
+                    dashboardView.updateMediaInfo(tTitle, tArtist, tAlbum, true)
                 }
                 return
             }
@@ -143,7 +147,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 5. Check for Zlink / Tlink / CarPlay Connection Broadcasts
+            // 5. Check for Zlink / Tlink / CarPlay Connection & Media Broadcasts
             if (action.contains("zlink", ignoreCase = true) ||
                 action.contains("tlink", ignoreCase = true) ||
                 action.contains("carplay", ignoreCase = true)
@@ -228,18 +232,18 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 7. Otherwise process as Music / Podcast / Media App Metadata
+            // 7. Process Music / CarPlay Spotify / AVRCP Bluetooth Stream Metadata
             val track = extractFirstString(
                 bundle,
-                "track", "title", "music_title", "song", "episode", "name", "android.media.metadata.TITLE"
+                "track", "title", "music_title", "song", "episode", "name", "bt_title", "avrcp_title", "android.media.metadata.TITLE"
             )
             val artist = extractFirstString(
                 bundle,
-                "artist", "author", "music_artist", "writer", "podcast", "show", "android.media.metadata.ARTIST"
+                "artist", "author", "music_artist", "writer", "podcast", "show", "bt_artist", "avrcp_artist", "android.media.metadata.ARTIST"
             )
             val album = extractFirstString(
                 bundle,
-                "album", "music_album", "series", "station", "android.media.metadata.ALBUM"
+                "album", "music_album", "series", "station", "bt_album", "avrcp_album", "android.media.metadata.ALBUM"
             )
 
             val isPlaying = when {
@@ -266,21 +270,52 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Handles pressing `<` (Previous) or `>` (Next) on the bottom arc of the home screen.
-     * Steps the active Music/Podcast track OR steps the Radio station, then forces an immediate
-     * refresh of the scrolling blue text!
+     * Controls CarPlay Spotify (Play/Pause, Next, Previous) when the Center Hub is in Mode 4 (5th option).
+     * Sends commands to the active CarPlay / iPhone AVRCP session rather than launching any local Android Spotify app.
      */
+    fun controlCarPlaySpotify(command: String) {
+        when (command) {
+            "PLAY_PAUSE" -> {
+                mediaHelper.playPause()
+                try {
+                    sendBroadcast(Intent("com.zjinnova.zlink.action.MEDIA_PLAY_PAUSE"))
+                    sendBroadcast(Intent("com.xyauto.broadcast.BT_MUSIC_PLAY_PAUSE"))
+                } catch (_: Exception) {}
+            }
+            "NEXT" -> {
+                mediaHelper.nextTrack()
+                try {
+                    sendBroadcast(Intent("com.zjinnova.zlink.action.MEDIA_NEXT"))
+                    sendBroadcast(Intent("com.xyauto.broadcast.BT_MUSIC_NEXT"))
+                } catch (_: Exception) {}
+            }
+            "PREV" -> {
+                mediaHelper.prevTrack()
+                try {
+                    sendBroadcast(Intent("com.zjinnova.zlink.action.MEDIA_PREV"))
+                    sendBroadcast(Intent("com.xyauto.broadcast.BT_MUSIC_PREV"))
+                } catch (_: Exception) {}
+            }
+        }
+        sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
+        mainHandler.postDelayed({
+            sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
+            dashboardView.syncAudioAndRadioState()
+        }, 350L)
+        mainHandler.postDelayed({
+            dashboardView.syncAudioAndRadioState()
+        }, 850L)
+    }
+
     fun stepTrackOrRadioStation(isNext: Boolean, isRadioMode: Boolean, prefs: SharedPreferences) {
         val beforeRadioText = prefs.getString("last_radio_text", "").orEmpty()
 
-        // 1. Always dispatch standard hardware media key event (works for Spotify, Podcasts, Music, and most Radio apps)
         if (isNext) {
             mediaHelper.nextTrack()
         } else {
             mediaHelper.prevTrack()
         }
 
-        // 2. If Radio is active, also send XYAuto / Topway / Microntek MCU Radio Step broadcasts
         if (isRadioMode) {
             try {
                 val dir = if (isNext) 1 else -1
@@ -290,11 +325,8 @@ class MainActivity : AppCompatActivity() {
                 sendBroadcast(Intent("com.tw.radio.action").putExtra("step", dir))
             } catch (_: Exception) {}
 
-            // Ask Accessibility Service to scan all interactive windows right away
             sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
 
-            // Check after 250ms if the station text updated in SharedPreferences/getprop.
-            // If the XYAuto Radio app only updates its UI when foregrounded, perform a rapid 180ms "Peek & Read" sync!
             mainHandler.postDelayed({
                 val polled = pollSystemRadioFrequency(prefs)
                 if (polled.isNotEmpty() && polled != beforeRadioText) {
@@ -309,7 +341,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }, 260L)
         } else {
-            // For Music / Podcast apps: trigger multi-stage metadata & notification scan at 250ms and 700ms
             sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
             mainHandler.postDelayed({
                 sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", false))
@@ -321,10 +352,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Briefly wakes the mapped Radio window for 180ms so the XYAuto MCU redraws the new station
-     * frequency for our Accessibility Screen Reader, then immediately returns to the Home Launcher.
-     */
     private fun performQuickRadioUiSync(prefs: SharedPreferences) {
         val radioPkg = prefs.getString("pkg_RADIO", null) ?: return
         val radioCls = prefs.getString("cls_RADIO", null)
@@ -345,7 +372,6 @@ class MainActivity : AppCompatActivity() {
             if (peekIntent != null) {
                 startActivity(peekIntent)
                 sendBroadcast(Intent("com.custom.carlauncher.FORCE_A11Y_SCAN").putExtra("return_home", true))
-                // Guaranteed fallback to bring Eye of Sauron Launcher right back to the front
                 mainHandler.postDelayed({
                     prefs.edit().putBoolean("pending_radio_peek", false).apply()
                     val homeIntent = Intent(this, MainActivity::class.java).apply {
@@ -471,6 +497,7 @@ class MainActivity : AppCompatActivity() {
 
     fun updateCenterMapVisibility() {
         if (!::circularMapWebView.isInitialized || !::dashboardView.isInitialized) return
+        // Circular map WebView is ONLY visible on Mode 3 (4th option) when CarPlay is actively connected
         val shouldShowLiveCircleMap = (dashboardView.getCenterMode() == 3) && isCarPlayActivelyConnected()
 
         if (shouldShowLiveCircleMap) {
@@ -588,6 +615,7 @@ class MainActivity : AppCompatActivity() {
             addAction("com.microntek.music.report")
             addAction("com.xyauto.music.metachanged")
             addAction("com.xyauto.broadcast.MUSIC_INFO")
+            addAction("com.xyauto.broadcast.BT_MUSIC_INFO")
             addAction("com.xyauto.broadcast.RADIO_INFO")
             addAction("com.xyauto.radio.metachanged")
             addAction("com.xyauto.broadcast.radio")
@@ -951,12 +979,19 @@ class AgamaDashboardView(
     private val defaultSecondaryBlue = Color.parseColor("#4A90E2")
     private val defaultInnerRingGray = Color.parseColor("#5E6578")
     private val defaultWingBaseGray = Color.parseColor("#14171E")
+    private val spotifyGreen = Color.parseColor("#1DB954")
 
     private var primaryColor = prefs.getInt("primary_color_v3", defaultPrimaryRed)
     private var secondaryColor = prefs.getInt("secondary_color_v3", defaultSecondaryBlue)
     private var innerRingColor = prefs.getInt("inner_ring_color_v3", defaultInnerRingGray)
     private var wingBaseColor = prefs.getInt("wing_base_color_v3", defaultWingBaseGray)
 
+    // 5 Center Hub Modes:
+    // 0 = Glossy Subaru Emblem (Default)
+    // 1 = Live GPS Speedometer (MPH)
+    // 2 = Digital Clock + Speed + Compass
+    // 3 = CarPlay Center Circle Map (Subaru Standby when disconnected; Live Map inside circle when connected)
+    // 4 = CarPlay Spotify Hub (Subaru Standby with Spotify message when disconnected; CarPlay Spotify Info & Controls when connected)
     private var centerMode = prefs.getInt("center_mode", 0)
     private var currentMph = 0
     private var compassDir = prefs.getString("last_compass", "N") ?: "N"
@@ -965,6 +1000,8 @@ class AgamaDashboardView(
     private var isMediaBroadcastPlaying = false
     private var isRadioActive = prefs.getBoolean("is_radio_active", false)
     private var currentMediaText: String = prefs.getString("last_media_text", "") ?: ""
+    private var currentTrackTitle: String = prefs.getString("last_track_title", "CarPlay Spotify") ?: "CarPlay Spotify"
+    private var currentTrackArtist: String = prefs.getString("last_track_artist", "Connected via iPhone") ?: "Connected via iPhone"
     private var currentRadioText: String = prefs.getString("last_radio_text", "") ?: ""
     private var scrollXOffset = 0f
     private var pressedZone: String? = null
@@ -1183,12 +1220,23 @@ class AgamaDashboardView(
             prefs.edit().putBoolean("is_radio_active", false).apply()
         }
 
+        if (track.isNotEmpty()) {
+            currentTrackTitle = track
+            prefs.edit().putString("last_track_title", track).apply()
+        }
+        val cleanArtist = if (!artist.equals("<unknown>", ignoreCase = true)) artist else ""
+        val cleanAlbum = if (!album.equals("<unknown>", ignoreCase = true) && !album.equals(track, ignoreCase = true)) album else ""
+
+        val artistLine = listOf(cleanArtist, cleanAlbum).filter { it.isNotEmpty() }.joinToString(" • ")
+        if (artistLine.isNotEmpty()) {
+            currentTrackArtist = artistLine
+            prefs.edit().putString("last_track_artist", artistLine).apply()
+        }
+
         val parts = mutableListOf<String>()
         if (track.isNotEmpty()) parts.add(track)
-        if (artist.isNotEmpty() && !artist.equals("<unknown>", ignoreCase = true)) parts.add(artist)
-        if (album.isNotEmpty() && !album.equals("<unknown>", ignoreCase = true) && !album.equals(track, ignoreCase = true)) {
-            parts.add(album)
-        }
+        if (cleanArtist.isNotEmpty()) parts.add(cleanArtist)
+        if (cleanAlbum.isNotEmpty()) parts.add(cleanAlbum)
 
         if (parts.isNotEmpty()) {
             currentMediaText = parts.joinToString("  —  ")
@@ -1516,6 +1564,7 @@ class AgamaDashboardView(
                 canvas.drawText("$currentMph MPH • $compassDir", cx, cy + rHub * 0.42f, textPaint)
             }
             3 -> {
+                // 4th Option: CarPlay Map (shows Subaru Standby when CarPlay is not connected)
                 if (!hostActivity.isCarPlayActivelyConnected()) {
                     drawGlossySubaruBadge(canvas, cx, cy - rHub * 0.06f, rHub * 0.72f, rHub * 0.39f)
                     textPaint.textSize = rHub * 0.11f
@@ -1523,7 +1572,114 @@ class AgamaDashboardView(
                     canvas.drawText("CARPLAY NAV STANDBY", cx, cy + rHub * 0.62f, textPaint)
                 }
             }
+            4 -> {
+                // 5th Option: CarPlay Spotify Hub (shows Subaru Standby when CarPlay is not connected;
+                // shows CarPlay Spotify track info & interactive playback controls when CarPlay IS connected)
+                drawCarPlaySpotifyHub(canvas, cx, cy, rHub)
+            }
         }
+    }
+
+    private fun drawCarPlaySpotifyHub(canvas: Canvas, cx: Float, cy: Float, rHub: Float) {
+        if (!hostActivity.isCarPlayActivelyConnected()) {
+            drawGlossySubaruBadge(canvas, cx, cy - rHub * 0.06f, rHub * 0.72f, rHub * 0.39f)
+            textPaint.textSize = rHub * 0.105f
+            textPaint.color = spotifyGreen
+            canvas.drawText("CARPLAY SPOTIFY STANDBY", cx, cy + rHub * 0.62f, textPaint)
+            return
+        }
+
+        // Clip inside the center circle
+        canvas.save()
+        val clipPath = Path().apply { addCircle(cx, cy, rHub - 4f, Path.Direction.CW) }
+        canvas.clipPath(clipPath)
+
+        // Subtle Spotify dark emerald radial glow at top of hub
+        val spotGlow = RadialGradient(
+            cx, cy - rHub * 0.35f, rHub * 0.95f,
+            intArrayOf(Color.argb(65, 29, 185, 84), Color.TRANSPARENT),
+            floatArrayOf(0f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        fillPaint.shader = spotGlow
+        canvas.drawCircle(cx, cy, rHub, fillPaint)
+        fillPaint.shader = null
+
+        // 1. Vector Spotify Logo Badge at Top of Circle
+        val logoY = cy - rHub * 0.58f
+        val logoR = rHub * 0.14f
+        fillPaint.color = spotifyGreen
+        canvas.drawCircle(cx, logoY, logoR, fillPaint)
+
+        // 3 Curved Black Sound Waves inside Spotify Circle
+        iconPaint.color = Color.parseColor("#08090C")
+        iconPaint.strokeWidth = rHub * 0.024f
+        canvas.drawArc(RectF(cx - logoR * 0.68f, logoY - logoR * 0.45f, cx + logoR * 0.68f, logoY + logoR * 0.35f), 205f, 130f, false, iconPaint)
+        iconPaint.strokeWidth = rHub * 0.020f
+        canvas.drawArc(RectF(cx - logoR * 0.56f, logoY - logoR * 0.15f, cx + logoR * 0.56f, logoY + logoR * 0.55f), 208f, 124f, false, iconPaint)
+        iconPaint.strokeWidth = rHub * 0.017f
+        canvas.drawArc(RectF(cx - logoR * 0.44f, logoY + logoR * 0.12f, cx + logoR * 0.44f, logoY + logoR * 0.72f), 212f, 116f, false, iconPaint)
+
+        // 2. "CARPLAY SPOTIFY" Header
+        textPaint.color = spotifyGreen
+        textPaint.textSize = rHub * 0.105f
+        canvas.drawText("CARPLAY SPOTIFY", cx, cy - rHub * 0.32f, textPaint)
+
+        // 3. Song Title & Artist Readout (from iPhone CarPlay stream)
+        textPaint.color = Color.WHITE
+        textPaint.textSize = rHub * 0.14f
+        val displayTitle = currentTrackTitle.ifBlank { "Spotify Active" }.take(20)
+        canvas.drawText(displayTitle, cx, cy - rHub * 0.10f, textPaint)
+
+        textPaint.color = secondaryColor
+        textPaint.textSize = rHub * 0.105f
+        val displayArtist = currentTrackArtist.ifBlank { "iPhone CarPlay Audio" }.take(24)
+        canvas.drawText(displayArtist, cx, cy + rHub * 0.08f, textPaint)
+
+        // 4. Interactive Transport Control Buttons in Lower Half of Circle (|<<   Play/Pause   >>|)
+        val ctrlY = cy + rHub * 0.44f
+        val btnSpacing = rHub * 0.46f
+        val playBtnRadius = rHub * 0.17f
+        val sideBtnRadius = rHub * 0.13f
+
+        // Previous Button Circle (Left)
+        fillPaint.color = if (pressedZone == "SPOTIFY_PREV") podPressedColor else Color.parseColor("#1E242E")
+        canvas.drawCircle(cx - btnSpacing, ctrlY, sideBtnRadius, fillPaint)
+        canvas.drawCircle(cx - btnSpacing, ctrlY, sideBtnRadius, thinWhiteStrokePaint)
+        drawRedOutlinedText(canvas, "|<", cx - btnSpacing, ctrlY + rHub * 0.045f, rHub * 0.12f)
+
+        // Play / Pause Button Circle (Center)
+        fillPaint.color = if (pressedZone == "SPOTIFY_PLAY_PAUSE") Color.parseColor("#25E065") else spotifyGreen
+        canvas.drawCircle(cx, ctrlY, playBtnRadius, fillPaint)
+        canvas.drawCircle(cx, ctrlY, playBtnRadius, thinWhiteStrokePaint)
+
+        val isPlayingNow = audioManager.isMusicActive || isMediaBroadcastPlaying
+        if (isPlayingNow) {
+            // Draw Pause Bars
+            fillPaint.color = Color.parseColor("#08090C")
+            val barW = playBtnRadius * 0.22f
+            val barH = playBtnRadius * 0.46f
+            canvas.drawRoundRect(RectF(cx - barW * 1.6f, ctrlY - barH, cx - barW * 0.4f, ctrlY + barH), 3f, 3f, fillPaint)
+            canvas.drawRoundRect(RectF(cx + barW * 0.4f, ctrlY - barH, cx + barW * 1.6f, ctrlY + barH), 3f, 3f, fillPaint)
+        } else {
+            // Draw Play Triangle
+            val playTri = Path().apply {
+                moveTo(cx - playBtnRadius * 0.25f, ctrlY - playBtnRadius * 0.42f)
+                lineTo(cx + playBtnRadius * 0.45f, ctrlY)
+                lineTo(cx - playBtnRadius * 0.25f, ctrlY + playBtnRadius * 0.42f)
+                close()
+            }
+            fillPaint.color = Color.parseColor("#08090C")
+            canvas.drawPath(playTri, fillPaint)
+        }
+
+        // Next Button Circle (Right)
+        fillPaint.color = if (pressedZone == "SPOTIFY_NEXT") podPressedColor else Color.parseColor("#1E242E")
+        canvas.drawCircle(cx + btnSpacing, ctrlY, sideBtnRadius, fillPaint)
+        canvas.drawCircle(cx + btnSpacing, ctrlY, sideBtnRadius, thinWhiteStrokePaint)
+        drawRedOutlinedText(canvas, ">|", cx + btnSpacing, ctrlY + rHub * 0.045f, rHub * 0.12f)
+
+        canvas.restore()
     }
 
     private fun drawGlossySubaruBadge(canvas: Canvas, cx: Float, cy: Float, rx: Float, ry: Float) {
@@ -1875,7 +2031,19 @@ class AgamaDashboardView(
         val rHub = h * 0.29f
         val rInner = h * 0.465f
 
-        if (dist <= rHub) return "CENTER_HUB"
+        if (dist <= rHub) {
+            // If in Mode 4 (5th option: CarPlay Spotify) AND CarPlay is connected,
+            // check if the user tapped one of the 3 transport control buttons in the lower half of the circle
+            if (centerMode == 4 && hostActivity.isCarPlayActivelyConnected() && dy > rHub * 0.18f) {
+                val btnSpacing = rHub * 0.46f
+                return when {
+                    dx < -btnSpacing * 0.5f -> "SPOTIFY_PREV"
+                    dx > btnSpacing * 0.5f -> "SPOTIFY_NEXT"
+                    else -> "SPOTIFY_PLAY_PAUSE"
+                }
+            }
+            return "CENTER_HUB"
+        }
 
         if (dist <= rInner) {
             val angle = (Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())) + 360) % 360
@@ -1936,11 +2104,28 @@ class AgamaDashboardView(
                 if (isLongPress) {
                     showCenterHubDisplayPicker()
                 } else {
-                    centerMode = (centerMode + 1) % 4
+                    // Cycles cleanly through all 5 Center Modes (0, 1, 2, 3, 4)
+                    centerMode = (centerMode + 1) % 5
                     prefs.edit().putInt("center_mode", centerMode).apply()
                     hostActivity.updateCenterMapVisibility()
                     invalidate()
                 }
+            }
+            "SPOTIFY_PREV" -> {
+                if (isLongPress) showCenterHubDisplayPicker()
+                else hostActivity.controlCarPlaySpotify("PREV")
+            }
+            "SPOTIFY_PLAY_PAUSE" -> {
+                if (isLongPress) showCenterHubDisplayPicker()
+                else {
+                    isMediaBroadcastPlaying = !isMediaBroadcastPlaying
+                    hostActivity.controlCarPlaySpotify("PLAY_PAUSE")
+                    invalidate()
+                }
+            }
+            "SPOTIFY_NEXT" -> {
+                if (isLongPress) showCenterHubDisplayPicker()
+                else hostActivity.controlCarPlaySpotify("NEXT")
             }
             "VOL_DOWN" -> audioManager.adjustStreamVolume(
                 AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI
@@ -2015,12 +2200,13 @@ class AgamaDashboardView(
             "2. Live GPS Speedometer (MPH)",
             "3. Digital Clock & Compass",
             "4. CarPlay Center Circle Map (Subaru Standby when disconnected)",
+            "5. CarPlay Spotify Hub (Subaru Standby when disconnected)",
             "Open Stock Launcher / Home Settings"
         )
         AlertDialog.Builder(context)
-            .setTitle("Center Circle Display Mode")
+            .setTitle("Center Circle Display Mode (5 Options)")
             .setItems(modes) { _, which ->
-                if (which in 0..3) {
+                if (which in 0..4) {
                     centerMode = which
                     prefs.edit().putInt("center_mode", centerMode).apply()
                     hostActivity.updateCenterMapVisibility()
@@ -2351,11 +2537,11 @@ class AgamaDashboardView(
 
     private fun showEscapeHatchDialog() {
         val readerStatus = if (hostActivity.isAccessibilityReaderEnabled()) "ENABLED" else "TAP TO ENABLE"
-        val cpSimulated = if (hostActivity.carPlaySessionActive) "ACTIVE (Tap to set Standby)" else "STANDBY (Tap to test Map)"
+        val cpSimulated = if (hostActivity.carPlaySessionActive) "ACTIVE (Tap to set Standby)" else "STANDBY (Tap to test Map/Spotify)"
         val options = arrayOf(
             "Enable Radio Screen Reader ($readerStatus)",
-            "Center Circle Mode (Subaru / MPH / Clock / CarPlay Map)",
-            "Toggle CarPlay Map Active State ($cpSimulated)",
+            "Center Circle Mode (Subaru / MPH / Clock / Map / Spotify)",
+            "Toggle CarPlay Active State ($cpSimulated)",
             "Switch / Revert to Stock XYAuto Launcher",
             "Open Android System Settings",
             "Radio & App Inspector (Diagnostics)",
